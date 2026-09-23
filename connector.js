@@ -1,2814 +1,3351 @@
-'use strict';
+/**
+ * RB WhatsApp Connector
+ * Version: 2.0.0
+ *
+ * Compatible with:
+ * - RB PHP WhatsApp Management Panel
+ * - Multiple WhatsApp accounts
+ * - QR connection
+ * - Pairing-code connection
+ * - Text messages
+ * - Media messages
+ * - Opt-in bulk messaging
+ * - Bulk job progress
+ * - Account status
+ *
+ * Requirements:
+ *   Node.js 20+
+ *
+ * Install:
+ *   npm install
+ *
+ * Start:
+ *   npm start
+ *
+ * Environment:
+ *   PORT=3000
+ *   API_TOKEN=your-secret-token
+ */
 
-/*
-  RB WhatsApp Multi-Account Connector
-  ------------------------------------
-  Node.js 20+
-  Baileys multi-session connector
+import express from "express";
+import cors from "cors";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import pino from "pino";
+import QRCode from "qrcode";
+import { fileURLToPath } from "url";
+import { Boom } from "@hapi/boom";
 
-  Features:
-  - Multiple WhatsApp accounts
-  - Separate auth folder for every account
-  - QR login
-  - Pairing-code login
-  - Automatic reconnect
-  - Connect / disconnect / reset
-  - Text messages
-  - Image/document/video/audio by URL
-  - Bulk queue with rate limiting
-  - API token authentication
-  - Account status
-  - Incoming message events
-  - Health endpoint
+import makeWASocket, {
+    DisconnectReason,
+    useMultiFileAuthState,
+    makeCacheableSignalKeyStore,
+    fetchLatestBaileysVersion
+} from "@whiskeysockets/baileys";
 
-  IMPORTANT:
-  Use bulk messaging only for recipients who have opted in.
-*/
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const P = require('pino');
-const { Boom } = require('@hapi/boom');
-
-const {
-  default: makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState,
-  makeCacheableSignalKeyStore,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
-
-const QRCode = require('qrcode');
-
-
-// ============================================================
-// CONFIG
-// ============================================================
+/* =========================================================
+   CONFIG
+========================================================= */
 
 const PORT = Number(process.env.PORT || 3000);
 
 const API_TOKEN =
-  process.env.API_TOKEN ||
-  'CHANGE_THIS_LONG_RANDOM_CONNECTOR_TOKEN';
+    process.env.API_TOKEN ||
+    "CHANGE_THIS_CONNECTOR_TOKEN";
 
 const DATA_DIR =
-  process.env.DATA_DIR ||
-  path.join(__dirname, 'data');
+    process.env.DATA_DIR ||
+    path.join(__dirname, "data");
 
 const AUTH_DIR =
-  process.env.AUTH_DIR ||
-  path.join(DATA_DIR, 'auth');
+    process.env.AUTH_DIR ||
+    path.join(DATA_DIR, "auth");
+
+const ACCOUNTS_FILE =
+    path.join(DATA_DIR, "accounts.json");
+
+const JOBS_FILE =
+    path.join(DATA_DIR, "jobs.json");
+
+const LOG_FILE =
+    path.join(DATA_DIR, "connector.log");
+
+const DEFAULT_BULK_DELAY =
+    Math.max(
+        1000,
+        Number(process.env.DEFAULT_BULK_DELAY || 2000)
+    );
 
 const MAX_BULK_RECIPIENTS =
-  Number(process.env.MAX_BULK_RECIPIENTS || 50);
+    Math.min(
+        500,
+        Math.max(
+            1,
+            Number(process.env.MAX_BULK_RECIPIENTS || 100)
+        )
+    );
 
-const DEFAULT_DELAY_MS =
-  Math.max(
-    Number(process.env.DEFAULT_DELAY_MS || 1500),
-    1000
-  );
+const QR_TTL =
+    Number(process.env.QR_TTL || 120000);
 
-const MAX_MESSAGE_LENGTH =
-  Number(process.env.MAX_MESSAGE_LENGTH || 4096);
+const REQUEST_TIMEOUT =
+    Number(process.env.REQUEST_TIMEOUT || 30000);
 
+/* =========================================================
+   DIRECTORIES
+========================================================= */
 
-// ============================================================
-// DIRECTORIES
-// ============================================================
-
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(AUTH_DIR, { recursive: true });
-
-
-// ============================================================
-// LOGGER
-// ============================================================
-
-const logger = P({
-  level: process.env.LOG_LEVEL || 'info'
+fs.mkdirSync(DATA_DIR, {
+    recursive: true
 });
 
+fs.mkdirSync(AUTH_DIR, {
+    recursive: true
+});
 
-// ============================================================
-// EXPRESS
-// ============================================================
+/* =========================================================
+   LOGGER
+========================================================= */
+
+const logger = pino(
+    {
+        level: process.env.LOG_LEVEL || "info"
+    },
+    pino.destination(LOG_FILE)
+);
+
+const consoleLogger = pino({
+    level: process.env.LOG_LEVEL || "info"
+});
+
+/* =========================================================
+   EXPRESS
+========================================================= */
 
 const app = express();
 
-app.use(express.json({
-  limit: '2mb'
-}));
+app.disable("x-powered-by");
 
-app.use(express.urlencoded({
-  extended: true,
-  limit: '2mb'
-}));
+app.use(
+    cors({
+        origin: false,
+        methods: [
+            "GET",
+            "POST",
+            "DELETE",
+            "OPTIONS"
+        ],
+        allowedHeaders: [
+            "Content-Type",
+            "Authorization",
+            "X-Connector-Token"
+        ]
+    })
+);
 
+app.use(
+    express.json({
+        limit: "10mb"
+    })
+);
 
-// ============================================================
-// SECURITY HEADERS
-// ============================================================
+app.use(
+    express.urlencoded({
+        extended: true,
+        limit: "10mb"
+    })
+);
 
-app.use((req, res, next) => {
+/* =========================================================
+   IN-MEMORY STATE
+========================================================= */
 
-  res.setHeader(
-    'X-Content-Type-Options',
-    'nosniff'
-  );
+const sockets = new Map();
+const connecting = new Map();
+const bulkRunning = new Map();
 
-  res.setHeader(
-    'X-Frame-Options',
-    'DENY'
-  );
+let accounts = loadJSON(
+    ACCOUNTS_FILE,
+    {}
+);
 
-  res.setHeader(
-    'Referrer-Policy',
-    'no-referrer'
-  );
+let jobs = loadJSON(
+    JOBS_FILE,
+    {}
+);
 
-  next();
-});
-
-
-// ============================================================
-// HELPERS
-// ============================================================
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function now() {
-  return new Date().toISOString();
+    return new Date().toISOString();
 }
 
+function makeId(prefix = "id") {
+    return (
+        prefix +
+        "_" +
+        crypto.randomBytes(8).toString("hex")
+    );
+}
+
+function safeString(value) {
+    if (value === undefined || value === null) {
+        return "";
+    }
+
+    return String(value).trim();
+}
 
 function sleep(ms) {
-  return new Promise(resolve => {
-    setTimeout(resolve, ms);
-  });
+    return new Promise(resolve =>
+        setTimeout(resolve, ms)
+    );
 }
 
+function loadJSON(file, fallback) {
+    try {
+        if (!fs.existsSync(file)) {
+            fs.writeFileSync(
+                file,
+                JSON.stringify(
+                    fallback,
+                    null,
+                    2
+                )
+            );
 
-function safeId(value) {
+            return fallback;
+        }
 
-  value = String(value || '').trim();
+        const raw =
+            fs.readFileSync(
+                file,
+                "utf8"
+            );
 
-  if (!value) {
-    return null;
-  }
+        if (!raw.trim()) {
+            return fallback;
+        }
 
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value)) {
-    return null;
-  }
+        return JSON.parse(raw);
+    } catch (error) {
+        consoleLogger.error(
+            {
+                error: error.message,
+                file
+            },
+            "JSON load failed"
+        );
 
-  return value;
+        return fallback;
+    }
 }
 
+function saveJSON(file, data) {
+    const temp =
+        file +
+        "." +
+        process.pid +
+        ".tmp";
+
+    fs.writeFileSync(
+        temp,
+        JSON.stringify(
+            data,
+            null,
+            2
+        )
+    );
+
+    fs.renameSync(
+        temp,
+        file
+    );
+}
+
+function saveAccounts() {
+    saveJSON(
+        ACCOUNTS_FILE,
+        accounts
+    );
+}
+
+function saveJobs() {
+    saveJSON(
+        JOBS_FILE,
+        jobs
+    );
+}
+
+function logEvent(
+    type,
+    message,
+    extra = {}
+) {
+    logger.info(
+        {
+            type,
+            ...extra
+        },
+        message
+    );
+
+    consoleLogger.info(
+        {
+            type,
+            ...extra
+        },
+        message
+    );
+}
 
 function normalizePhone(phone) {
-
-  let value = String(phone || '')
-    .trim()
-    .replace(/[^\d]/g, '');
-
-  if (value.startsWith('00')) {
-    value = value.substring(2);
-  }
-
-  if (!value) {
-    return null;
-  }
-
-  /*
-    Do not automatically guess country codes.
-
-    Example:
-    919876543210
-  */
-
-  if (value.length < 8 || value.length > 15) {
-    return null;
-  }
-
-  return value;
+    return safeString(phone)
+        .replace(/[^\d]/g, "");
 }
 
+function phoneToJid(phone) {
+    const number =
+        normalizePhone(phone);
 
-function jidFromPhone(phone) {
-
-  const normalized = normalizePhone(phone);
-
-  if (!normalized) {
-    throw new Error('Invalid phone number');
-  }
-
-  return `${normalized}@s.whatsapp.net`;
-}
-
-
-function randomId(prefix = '') {
-
-  return (
-    prefix +
-    crypto.randomBytes(8).toString('hex')
-  );
-}
-
-
-function json(res, status, data) {
-
-  return res
-    .status(status)
-    .json(data);
-}
-
-
-function ok(res, data = {}) {
-
-  return json(res, 200, {
-    success: true,
-    ...data
-  });
-}
-
-
-function fail(res, status, message, extra = {}) {
-
-  return json(res, status, {
-    success: false,
-    error: message,
-    ...extra
-  });
-}
-
-
-// ============================================================
-// SIMPLE JSON DATABASE
-// ============================================================
-
-const DB_FILE =
-  path.join(DATA_DIR, 'accounts.json');
-
-
-function loadDB() {
-
-  try {
-
-    if (!fs.existsSync(DB_FILE)) {
-      return {
-        accounts: {}
-      };
+    if (!number) {
+        throw new Error(
+            "Invalid phone number"
+        );
     }
 
-    const raw =
-      fs.readFileSync(
-        DB_FILE,
-        'utf8'
-      );
-
-    const data =
-      JSON.parse(raw);
-
-    if (!data.accounts) {
-      data.accounts = {};
-    }
-
-    return data;
-
-  } catch (error) {
-
-    logger.error(error);
-
-    return {
-      accounts: {}
-    };
-  }
-}
-
-
-let database = loadDB();
-
-
-function saveDB() {
-
-  const temp =
-    DB_FILE + '.tmp';
-
-  fs.writeFileSync(
-    temp,
-    JSON.stringify(
-      database,
-      null,
-      2
-    ),
-    'utf8'
-  );
-
-  fs.renameSync(
-    temp,
-    DB_FILE
-  );
-}
-
-
-function getAccount(accountId) {
-
-  return database.accounts[accountId] || null;
-}
-
-
-function createAccount(accountId) {
-
-  const id =
-    safeId(accountId);
-
-  if (!id) {
-    throw new Error(
-      'Invalid account_id'
+    return (
+        number +
+        "@s.whatsapp.net"
     );
-  }
+}
 
-  if (!database.accounts[id]) {
+function getAccount(id) {
+    return accounts[id] || null;
+}
 
-    database.accounts[id] = {
+function accountFolder(id) {
+    return path.join(
+        AUTH_DIR,
+        id
+    );
+}
 
-      id,
+function ensureAccountShape(account) {
+    return {
+        id: account.id,
+        name: account.name || account.id,
 
-      created_at: now(),
+        phone:
+            account.phone ||
+            null,
 
-      updated_at: now(),
+        status:
+            account.status ||
+            "disconnected",
 
-      enabled: true,
+        connected:
+            Boolean(
+                account.connected
+            ),
 
-      phone: null,
+        qr:
+            account.qr ||
+            null,
 
-      status: 'disconnected',
+        qr_image:
+            account.qr_image ||
+            null,
 
-      connected: false,
+        qr_expires_at:
+            account.qr_expires_at ||
+            null,
 
-      qr: null,
+        pairing_code:
+            account.pairing_code ||
+            null,
 
-      qr_image: null,
+        connected_at:
+            account.connected_at ||
+            null,
 
-      qr_expires_at: null,
+        last_error:
+            account.last_error ||
+            null,
 
-      pairing_code: null,
+        created_at:
+            account.created_at ||
+            now(),
 
-      last_error: null,
-
-      connected_at: null
-
+        updated_at:
+            now()
     };
-
-    saveDB();
-  }
-
-  return database.accounts[id];
 }
-
-
-// ============================================================
-// SOCKET STORAGE
-// ============================================================
-
-const sessions =
-  new Map();
-
-
-/*
-  sessions.set(accountId, {
-    sock,
-    state,
-    saveCreds,
-    reconnectTimer,
-    connecting,
-    bulkQueue,
-    processingBulk
-  });
-*/
-
-
-function getSession(accountId) {
-
-  return sessions.get(accountId);
-}
-
-
-function getAuthPath(accountId) {
-
-  return path.join(
-    AUTH_DIR,
-    accountId
-  );
-}
-
-
-// ============================================================
-// STATUS
-// ============================================================
 
 function publicAccount(account) {
+    if (!account) {
+        return null;
+    }
 
-  if (!account) {
-    return null;
-  }
+    return {
+        id: account.id,
 
-  return {
+        name:
+            account.name ||
+            account.id,
 
-    id: account.id,
+        phone:
+            account.phone ||
+            null,
 
-    enabled: account.enabled,
+        status:
+            account.status ||
+            "disconnected",
 
-    phone: account.phone,
+        connected:
+            Boolean(
+                account.connected
+            ),
 
-    status: account.status,
+        qr_available:
+            Boolean(
+                account.qr
+            ),
 
-    connected: account.connected,
+        qr_image:
+            account.qr_image ||
+            null,
 
-    qr_available: !!account.qr,
+        qr_expires_at:
+            account.qr_expires_at ||
+            null,
 
-    qr_expires_at:
-      account.qr_expires_at,
+        pairing_code:
+            account.pairing_code ||
+            null,
 
-    pairing_code:
-      account.pairing_code,
+        connected_at:
+            account.connected_at ||
+            null,
 
-    connected_at:
-      account.connected_at,
+        last_error:
+            account.last_error ||
+            null,
 
-    last_error:
-      account.last_error,
+        created_at:
+            account.created_at ||
+            null,
 
-    created_at:
-      account.created_at,
-
-    updated_at:
-      account.updated_at
-  };
+        updated_at:
+            account.updated_at ||
+            null
+    };
 }
 
+/* =========================================================
+   AUTH MIDDLEWARE
+========================================================= */
+
+function authenticate(req, res, next) {
+    const token =
+        safeString(
+            req.headers[
+                "x-connector-token"
+            ]
+        ) ||
+        safeString(
+            req.headers.authorization
+        )
+            .replace(/^Bearer\s+/i, "");
+
+    if (!token) {
+        return res.status(401).json({
+            success: false,
+            error: "Missing connector token"
+        });
+    }
+
+    if (
+        !crypto.timingSafeEqual(
+            Buffer.from(token),
+            Buffer.from(API_TOKEN)
+        )
+    ) {
+        return res.status(401).json({
+            success: false,
+            error: "Invalid connector token"
+        });
+    }
+
+    next();
+}
+
+/*
+ * Safe timing-safe comparison.
+ */
+function tokenMatches(a, b) {
+    const aa = Buffer.from(
+        String(a || "")
+    );
+
+    const bb = Buffer.from(
+        String(b || "")
+    );
+
+    if (aa.length !== bb.length) {
+        return false;
+    }
+
+    return crypto.timingSafeEqual(
+        aa,
+        bb
+    );
+}
+
+/*
+ * Replace authenticate with safe comparison.
+ */
+app.use((req, res, next) => {
+    if (
+        req.path === "/health"
+    ) {
+        return next();
+    }
+
+    const token =
+        safeString(
+            req.headers[
+                "x-connector-token"
+            ]
+        ) ||
+        safeString(
+            req.headers.authorization
+        )
+            .replace(/^Bearer\s+/i, "");
+
+    if (
+        !tokenMatches(
+            token,
+            API_TOKEN
+        )
+    ) {
+        return res.status(401).json({
+            success: false,
+            error: "Unauthorized"
+        });
+    }
+
+    next();
+});
+
+/* =========================================================
+   SOCKET HELPERS
+========================================================= */
+
+function getSocket(accountId) {
+    return sockets.get(accountId) || null;
+}
 
 function updateAccount(
-  accountId,
-  patch
+    accountId,
+    patch
 ) {
+    const account =
+        accounts[accountId];
 
-  const account =
-    getAccount(accountId);
-
-  if (!account) {
-    return null;
-  }
-
-  Object.assign(
-    account,
-    patch,
-    {
-      updated_at: now()
+    if (!account) {
+        return null;
     }
-  );
 
-  saveDB();
+    Object.assign(
+        account,
+        patch,
+        {
+            updated_at: now()
+        }
+    );
 
-  return account;
+    saveAccounts();
+
+    return account;
 }
 
-
-// ============================================================
-// CONNECT ACCOUNT
-// ============================================================
-
-async function connectAccount(accountId) {
-
-  const id =
-    safeId(accountId);
-
-  if (!id) {
-    throw new Error(
-      'Invalid account_id'
+function clearQRCode(accountId) {
+    updateAccount(
+        accountId,
+        {
+            qr: null,
+            qr_image: null,
+            qr_expires_at: null
+        }
     );
-  }
+}
 
-  const account =
-    createAccount(id);
+function clearPairingCode(accountId) {
+    updateAccount(
+        accountId,
+        {
+            pairing_code: null
+        }
+    );
+}
 
-  const existing =
-    getSession(id);
+/* =========================================================
+   CONNECTION
+========================================================= */
 
-  if (existing?.connecting) {
-    return account;
-  }
+async function connectAccount(
+    accountId
+) {
+    const account =
+        getAccount(accountId);
 
-  if (
-    existing?.sock &&
-    account.connected
-  ) {
-    return account;
-  }
+    if (!account) {
+        throw new Error(
+            "Account not found"
+        );
+    }
 
-  if (existing?.sock) {
+    if (
+        connecting.has(accountId)
+    ) {
+        return;
+    }
+
+    const existing =
+        getSocket(accountId);
+
+    if (existing) {
+        try {
+            if (
+                existing.user &&
+                existing.ws?.isOpen
+            ) {
+                updateAccount(
+                    accountId,
+                    {
+                        status: "connected",
+                        connected: true
+                    }
+                );
+
+                return;
+            }
+        } catch (_) {}
+    }
+
+    connecting.set(
+        accountId,
+        true
+    );
+
+    updateAccount(
+        accountId,
+        {
+            status: "connecting",
+            connected: false,
+            last_error: null
+        }
+    );
 
     try {
-      existing.sock.end(
-        new Error(
-          'Reconnecting'
-        )
-      );
-    } catch (_) {}
+        const folder =
+            accountFolder(
+                accountId
+            );
 
-    sessions.delete(id);
-  }
+        fs.mkdirSync(
+            folder,
+            {
+                recursive: true
+            }
+        );
 
+        const {
+            state,
+            saveCreds
+        } =
+            await useMultiFileAuthState(
+                folder
+            );
 
-  updateAccount(id, {
+        let version;
 
-    status: 'connecting',
+        try {
+            const latest =
+                await fetchLatestBaileysVersion();
 
-    connected: false,
+            version =
+                latest.version;
+        } catch (error) {
+            consoleLogger.warn(
+                {
+                    error: error.message
+                },
+                "Could not fetch latest Baileys version"
+            );
+        }
 
-    last_error: null,
+        const socketConfig = {
+            auth: {
+                creds: state.creds,
 
-    pairing_code: null
-  });
+                keys:
+                    makeCacheableSignalKeyStore(
+                        state.keys,
+                        pino({
+                            level: "silent"
+                        })
+                    )
+            },
 
+            logger: pino({
+                level: "silent"
+            }),
 
-  const authPath =
-    getAuthPath(id);
+            markOnlineOnConnect:
+                false,
 
-  fs.mkdirSync(
-    authPath,
-    { recursive: true }
-  );
+            generateHighQualityLinkPreview:
+                false,
 
+            syncFullHistory:
+                false
+        };
 
-  const {
-    state,
-    saveCreds
-  } =
-    await useMultiFileAuthState(
-      authPath
-    );
+        if (version) {
+            socketConfig.version =
+                version;
+        }
 
+        const sock =
+            makeWASocket(
+                socketConfig
+            );
 
-  let version;
+        sockets.set(
+            accountId,
+            sock
+        );
 
-  try {
+        sock.ev.on(
+            "creds.update",
+            saveCreds
+        );
 
-    const latest =
-      await fetchLatestBaileysVersion();
+        sock.ev.on(
+            "connection.update",
+            async update => {
+                await handleConnectionUpdate(
+                    accountId,
+                    update
+                );
+            }
+        );
 
-    version =
-      latest.version;
+        sock.ev.on(
+            "messages.upsert",
+            async data => {
+                await handleMessages(
+                    accountId,
+                    data
+                );
+            }
+        );
 
-  } catch (error) {
+        sock.ev.on(
+            "contacts.update",
+            contacts => {
+                logEvent(
+                    "contacts",
+                    "Contacts updated",
+                    {
+                        accountId,
+                        count:
+                            Array.isArray(
+                                contacts
+                            )
+                                ? contacts.length
+                                : 0
+                    }
+                );
+            }
+        );
 
-    logger.warn(
-      'Could not fetch latest Baileys version'
-    );
-  }
+        return sock;
 
+    } catch (error) {
+        sockets.delete(
+            accountId
+        );
 
-  const session = {
+        updateAccount(
+            accountId,
+            {
+                status: "error",
+                connected: false,
+                last_error:
+                    error.message
+            }
+        );
 
-    sock: null,
+        throw error;
 
-    state,
-
-    saveCreds,
-
-    reconnectTimer: null,
-
-    connecting: true,
-
-    bulkQueue: [],
-
-    processingBulk: false
-
-  };
-
-
-  sessions.set(
-    id,
-    session
-  );
-
-
-  const sock =
-    makeWASocket({
-
-      ...(version
-        ? { version }
-        : {}),
-
-      auth: {
-
-        creds: state.creds,
-
-        keys:
-          makeCacheableSignalKeyStore(
-            state.keys,
-            logger
-          )
-
-      },
-
-      logger,
-
-      markOnlineOnConnect: false,
-
-      syncFullHistory: false,
-
-      generateHighQualityLinkPreview: false,
-
-      connectTimeoutMs: 60000,
-
-      defaultQueryTimeoutMs: 60000
-
-    });
-
-
-  session.sock =
-    sock;
-
-  session.connecting =
-    false;
-
-
-  // ----------------------------------------------------------
-  // SAVE AUTH
-  // ----------------------------------------------------------
-
-  sock.ev.on(
-    'creds.update',
-    async () => {
-
-      try {
-
-        await saveCreds();
-
-      } catch (error) {
-
-        logger.error({
-          accountId: id,
-          error
-        }, 'Failed to save credentials');
-
-      }
-
+    } finally {
+        connecting.delete(
+            accountId
+        );
     }
-  );
+}
 
+/* =========================================================
+   CONNECTION UPDATE
+========================================================= */
 
-  // ----------------------------------------------------------
-  // CONNECTION EVENTS
-  // ----------------------------------------------------------
-
-  sock.ev.on(
-    'connection.update',
-    async update => {
-
-      const {
+async function handleConnectionUpdate(
+    accountId,
+    update
+) {
+    const {
         connection,
         lastDisconnect,
         qr
-      } = update;
+    } = update;
 
+    const account =
+        getAccount(accountId);
 
-      // QR received
-      if (qr) {
+    if (!account) {
+        return;
+    }
 
-        let qrImage = null;
-
+    if (qr) {
         try {
+            const qrImage =
+                await QRCode.toDataURL(
+                    qr,
+                    {
+                        margin: 2,
+                        width: 420
+                    }
+                );
 
-          qrImage =
-            await QRCode.toDataURL(
-              qr,
-              {
-                width: 360,
-                margin: 2
-              }
+            updateAccount(
+                accountId,
+                {
+                    status: "qr",
+                    connected: false,
+                    qr,
+                    qr_image:
+                        qrImage,
+                    qr_expires_at:
+                        new Date(
+                            Date.now() +
+                            QR_TTL
+                        ).toISOString(),
+                    last_error: null
+                }
+            );
+
+            logEvent(
+                "qr",
+                "QR generated",
+                {
+                    accountId
+                }
             );
 
         } catch (error) {
-
-          logger.error(error);
-
+            updateAccount(
+                accountId,
+                {
+                    status: "error",
+                    last_error:
+                        error.message
+                }
+            );
         }
+    }
 
-
-        updateAccount(id, {
-
-          status: 'qr',
-
-          connected: false,
-
-          qr,
-
-          qr_image: qrImage,
-
-          qr_expires_at:
-            new Date(
-              Date.now() +
-              60000
-            ).toISOString(),
-
-          pairing_code: null
-
-        });
-
-
-        logger.info(
-          `[${id}] QR generated`
+    if (
+        connection === "connecting"
+    ) {
+        updateAccount(
+            accountId,
+            {
+                status: "connecting",
+                connected: false
+            }
         );
-      }
+    }
 
+    if (
+        connection === "open"
+    ) {
+        const sock =
+            getSocket(accountId);
 
-      // Connection opened
-      if (
-        connection === 'open'
-      ) {
+        let phone =
+            account.phone ||
+            null;
 
-        const me =
-          sock.user;
+        try {
+            if (
+                sock?.user?.id
+            ) {
+                phone =
+                    normalizePhone(
+                        sock.user.id.split(
+                            ":"
+                        )[0]
+                    );
+            }
+        } catch (_) {}
 
-
-        const phone =
-          me?.id
-            ?.split(':')[0]
-            ?.split('@')[0]
-          || null;
-
-
-        updateAccount(id, {
-
-          status: 'connected',
-
-          connected: true,
-
-          phone,
-
-          qr: null,
-
-          qr_image: null,
-
-          qr_expires_at: null,
-
-          pairing_code: null,
-
-          last_error: null,
-
-          connected_at: now()
-
-        });
-
-
-        logger.info(
-          `[${id}] WhatsApp connected ${phone || ''}`
+        updateAccount(
+            accountId,
+            {
+                phone,
+                status: "connected",
+                connected: true,
+                connected_at:
+                    now(),
+                qr: null,
+                qr_image: null,
+                qr_expires_at: null,
+                pairing_code: null,
+                last_error: null
+            }
         );
-      }
 
+        logEvent(
+            "connected",
+            "WhatsApp account connected",
+            {
+                accountId,
+                phone
+            }
+        );
+    }
 
-      // Connection closed
-      if (
-        connection === 'close'
-      ) {
+    if (
+        connection === "close"
+    ) {
+        sockets.delete(
+            accountId
+        );
 
         const statusCode =
-          new Boom(
             lastDisconnect?.error
-          )?.output?.statusCode;
-
+                ? (
+                    lastDisconnect
+                        .error
+                        ?.output
+                        ?.statusCode
+                )
+                : undefined;
 
         const loggedOut =
-          statusCode ===
-          DisconnectReason.loggedOut;
+            statusCode ===
+            DisconnectReason.loggedOut;
 
+        const restartRequired =
+            statusCode ===
+            DisconnectReason.restartRequired;
 
-        const connectionReplaced =
-          statusCode ===
-          DisconnectReason.connectionReplaced;
-
-
-        updateAccount(id, {
-
-          status:
-            loggedOut
-              ? 'logged_out'
-              : 'disconnected',
-
-          connected: false,
-
-          last_error:
-            lastDisconnect?.error
-              ?.message ||
-            `Connection closed (${statusCode || 'unknown'})`
-
-        });
-
-
-        logger.warn(
-          `[${id}] Connection closed: ${statusCode || 'unknown'}`
-        );
-
-
-        /*
-          Do not reconnect when WhatsApp explicitly logged
-          the account out.
-        */
-
-        if (
-          !loggedOut &&
-          !connectionReplaced
-        ) {
-
-          scheduleReconnect(id);
-
-        } else {
-
-          sessions.delete(id);
-
-        }
-      }
-
-    }
-  );
-
-
-  // ----------------------------------------------------------
-  // INCOMING MESSAGES
-  // ----------------------------------------------------------
-
-  sock.ev.on(
-    'messages.upsert',
-    async event => {
-
-      try {
-
-        for (
-          const message of
-          event.messages || []
-        ) {
-
-          if (!message?.message) {
-            continue;
-          }
-
-          const remoteJid =
-            message.key?.remoteJid;
-
-          if (!remoteJid) {
-            continue;
-          }
-
-          const text =
-            extractMessageText(
-              message
-            );
-
-          logger.info({
-
-            accountId: id,
-
-            from:
-              remoteJid,
-
-            text
-
-          }, 'Incoming WhatsApp message');
-
-        }
-
-      } catch (error) {
-
-        logger.error(error);
-
-      }
-
-    }
-  );
-
-
-  return getAccount(id);
-}
-
-
-// ============================================================
-// RECONNECT
-// ============================================================
-
-function scheduleReconnect(
-  accountId
-) {
-
-  const session =
-    getSession(accountId);
-
-  if (!session) {
-    return;
-  }
-
-
-  if (session.reconnectTimer) {
-    return;
-  }
-
-
-  session.reconnectTimer =
-    setTimeout(
-      async () => {
-
-        session.reconnectTimer =
-          null;
+        let errorMessage =
+            "Connection closed";
 
         try {
+            if (
+                lastDisconnect?.error
+            ) {
+                errorMessage =
+                    lastDisconnect
+                        .error
+                        .message ||
+                    errorMessage;
+            }
+        } catch (_) {}
 
-          await connectAccount(
-            accountId
-          );
+        if (loggedOut) {
+            updateAccount(
+                accountId,
+                {
+                    status: "logged_out",
+                    connected: false,
+                    last_error:
+                        "WhatsApp session logged out"
+                }
+            );
 
-        } catch (error) {
+            logEvent(
+                "logout",
+                "Account logged out",
+                {
+                    accountId
+                }
+            );
 
-          logger.error({
+            return;
+        }
+
+        updateAccount(
             accountId,
-            error
-          }, 'Reconnect failed');
-
-          scheduleReconnect(
-            accountId
-          );
-        }
-
-      },
-
-      5000
-    );
-}
-
-
-// ============================================================
-// EXTRACT MESSAGE TEXT
-// ============================================================
-
-function extractMessageText(
-  message
-) {
-
-  const msg =
-    message?.message;
-
-  if (!msg) {
-    return '';
-  }
-
-  return (
-
-    msg.conversation ||
-
-    msg.extendedTextMessage
-      ?.text ||
-
-    msg.imageMessage
-      ?.caption ||
-
-    msg.videoMessage
-      ?.caption ||
-
-    msg.documentMessage
-      ?.caption ||
-
-    ''
-
-  );
-}
-
-
-// ============================================================
-// QR
-// ============================================================
-
-async function getQR(
-  accountId
-) {
-
-  const account =
-    getAccount(accountId);
-
-  if (!account) {
-    throw new Error(
-      'Account not found'
-    );
-  }
-
-  return {
-
-    qr:
-      account.qr,
-
-    qr_image:
-      account.qr_image,
-
-    expires_at:
-      account.qr_expires_at
-
-  };
-}
-
-
-// ============================================================
-// PAIRING CODE
-// ============================================================
-
-async function requestPairingCode(
-  accountId,
-  phone
-) {
-
-  const normalized =
-    normalizePhone(phone);
-
-  if (!normalized) {
-    throw new Error(
-      'Invalid phone number'
-    );
-  }
-
-
-  let session =
-    getSession(accountId);
-
-
-  if (!session?.sock) {
-
-    await connectAccount(
-      accountId
-    );
-
-    session =
-      getSession(accountId);
-  }
-
-
-  if (!session?.sock) {
-    throw new Error(
-      'WhatsApp socket unavailable'
-    );
-  }
-
-
-  if (
-    session.state.creds.registered
-  ) {
-
-    throw new Error(
-      'This account is already registered'
-    );
-  }
-
-
-  const code =
-    await session.sock
-      .requestPairingCode(
-        normalized
-      );
-
-
-  updateAccount(
-    accountId,
-    {
-      status: 'pairing',
-
-      pairing_code:
-        code,
-
-      qr: null,
-
-      qr_image: null,
-
-      qr_expires_at: null
-    }
-  );
-
-
-  return code;
-}
-
-
-// ============================================================
-// SEND TEXT
-// ============================================================
-
-async function sendText(
-  accountId,
-  phone,
-  message
-) {
-
-  const account =
-    getAccount(accountId);
-
-  if (!account) {
-    throw new Error(
-      'Account not found'
-    );
-  }
-
-
-  const session =
-    getSession(accountId);
-
-
-  if (
-    !session?.sock ||
-    !account.connected
-  ) {
-
-    throw new Error(
-      'WhatsApp account is not connected'
-    );
-  }
-
-
-  const text =
-    String(message || '')
-      .trim();
-
-
-  if (!text) {
-    throw new Error(
-      'Message is required'
-    );
-  }
-
-
-  if (
-    text.length >
-    MAX_MESSAGE_LENGTH
-  ) {
-
-    throw new Error(
-      `Message too long. Maximum ${MAX_MESSAGE_LENGTH} characters`
-    );
-  }
-
-
-  const jid =
-    jidFromPhone(phone);
-
-
-  const result =
-    await session.sock.sendMessage(
-      jid,
-      {
-        text
-      }
-    );
-
-
-  return {
-
-    jid,
-
-    message_id:
-      result?.key?.id || null,
-
-    timestamp:
-      result?.messageTimestamp || null
-
-  };
-}
-
-
-// ============================================================
-// SEND MEDIA BY URL
-// ============================================================
-
-async function sendMedia(
-  accountId,
-  phone,
-  media
-) {
-
-  const account =
-    getAccount(accountId);
-
-  if (!account) {
-    throw new Error(
-      'Account not found'
-    );
-  }
-
-
-  const session =
-    getSession(accountId);
-
-
-  if (
-    !session?.sock ||
-    !account.connected
-  ) {
-
-    throw new Error(
-      'WhatsApp account is not connected'
-    );
-  }
-
-
-  const jid =
-    jidFromPhone(phone);
-
-
-  const type =
-    String(
-      media.type || 'image'
-    ).toLowerCase();
-
-
-  const url =
-    String(
-      media.url || ''
-    ).trim();
-
-
-  if (!url) {
-    throw new Error(
-      'media.url is required'
-    );
-  }
-
-
-  const caption =
-    String(
-      media.caption || ''
-    );
-
-
-  let content;
-
-
-  if (type === 'image') {
-
-    content = {
-
-      image: {
-        url
-      },
-
-      caption
-
-    };
-
-  } else if (
-    type === 'video'
-  ) {
-
-    content = {
-
-      video: {
-        url
-      },
-
-      caption
-
-    };
-
-  } else if (
-    type === 'audio'
-  ) {
-
-    content = {
-
-      audio: {
-        url
-      },
-
-      mimetype:
-        media.mimetype ||
-        'audio/mpeg',
-
-      ptt:
-        Boolean(media.ptt)
-
-    };
-
-  } else if (
-    type === 'document'
-  ) {
-
-    content = {
-
-      document: {
-        url
-      },
-
-      mimetype:
-        media.mimetype ||
-        'application/octet-stream',
-
-      fileName:
-        media.filename ||
-        'document'
-
-    };
-
-  } else {
-
-    throw new Error(
-      'Unsupported media type'
-    );
-  }
-
-
-  const result =
-    await session.sock.sendMessage(
-      jid,
-      content
-    );
-
-
-  return {
-
-    jid,
-
-    message_id:
-      result?.key?.id || null,
-
-    timestamp:
-      result?.messageTimestamp || null
-
-  };
-}
-
-
-// ============================================================
-// BULK QUEUE
-// ============================================================
-
-async function createBulkJob(
-  accountId,
-  recipients,
-  message,
-  delayMs
-) {
-
-  const account =
-    getAccount(accountId);
-
-  if (!account) {
-    throw new Error(
-      'Account not found'
-    );
-  }
-
-
-  if (!account.connected) {
-    throw new Error(
-      'Account is not connected'
-    );
-  }
-
-
-  if (!Array.isArray(recipients)) {
-
-    throw new Error(
-      'recipients must be an array'
-    );
-  }
-
-
-  if (
-    recipients.length === 0
-  ) {
-
-    throw new Error(
-      'No recipients'
-    );
-  }
-
-
-  if (
-    recipients.length >
-    MAX_BULK_RECIPIENTS
-  ) {
-
-    throw new Error(
-      `Maximum ${MAX_BULK_RECIPIENTS} recipients per job`
-    );
-  }
-
-
-  const text =
-    String(message || '')
-      .trim();
-
-
-  if (!text) {
-    throw new Error(
-      'Message is required'
-    );
-  }
-
-
-  const delay =
-    Math.max(
-      Number(delayMs || DEFAULT_DELAY_MS),
-      DEFAULT_DELAY_MS
-    );
-
-
-  const items =
-    recipients.map(
-      phone => {
-
-        const normalized =
-          normalizePhone(phone);
-
-        if (!normalized) {
-          return {
-
-            phone:
-              String(phone),
-
-            status:
-              'failed',
-
-            error:
-              'Invalid phone number'
-
-          };
-        }
-
-        return {
-
-          phone:
-            normalized,
-
-          status:
-            'queued',
-
-          error:
-            null
-
-        };
-
-      }
-    );
-
-
-  const job = {
-
-    id:
-      randomId('bulk_'),
-
-    account_id:
-      accountId,
-
-    message:
-      text,
-
-    delay_ms:
-      delay,
-
-    created_at:
-      now(),
-
-    started_at:
-      null,
-
-    completed_at:
-      null,
-
-    status:
-      'queued',
-
-    total:
-      items.length,
-
-    sent:
-      0,
-
-    failed:
-      items.filter(
-        x =>
-          x.status ===
-          'failed'
-      ).length,
-
-    items
-
-  };
-
-
-  const session =
-    getSession(accountId);
-
-
-  session.bulkQueue.push(
-    job
-  );
-
-
-  processBulkQueue(
-    accountId
-  );
-
-
-  return job;
-}
-
-
-// ============================================================
-// BULK PROCESSOR
-// ============================================================
-
-async function processBulkQueue(
-  accountId
-) {
-
-  const session =
-    getSession(accountId);
-
-  if (!session) {
-    return;
-  }
-
-
-  if (
-    session.processingBulk
-  ) {
-    return;
-  }
-
-
-  session.processingBulk =
-    true;
-
-
-  try {
-
-    while (
-      session.bulkQueue.length
-    ) {
-
-      const job =
-        session.bulkQueue.shift();
-
-
-      if (!job) {
-        continue;
-      }
-
-
-      job.status =
-        'running';
-
-      job.started_at =
-        now();
-
-
-      logger.info({
-        accountId,
-        jobId: job.id,
-        total: job.total
-      }, 'Bulk job started');
-
-
-      for (
-        const item of job.items
-      ) {
-
-        if (
-          item.status !==
-          'queued'
-        ) {
-          continue;
-        }
-
-
-        try {
-
-          const account =
-            getAccount(accountId);
-
-
-          if (
-            !account ||
-            !account.connected
-          ) {
-
-            throw new Error(
-              'Account disconnected'
-            );
-          }
-
-
-          const result =
-            await sendText(
-              accountId,
-              item.phone,
-              job.message
-            );
-
-
-          item.status =
-            'sent';
-
-          item.message_id =
-            result.message_id;
-
-          item.sent_at =
-            now();
-
-          job.sent++;
-
-        } catch (error) {
-
-          item.status =
-            'failed';
-
-          item.error =
-            error.message;
-
-          job.failed++;
-
-        }
-
+            {
+                status: "disconnected",
+                connected: false,
+                last_error:
+                    errorMessage
+            }
+        );
+
+        logEvent(
+            "disconnected",
+            "WhatsApp connection closed",
+            {
+                accountId,
+                statusCode
+            }
+        );
 
         /*
-          Minimum delay between recipients.
-          This is intentionally conservative.
-        */
-
-        await sleep(
-          job.delay_ms
-        );
-
-      }
-
-
-      job.status =
-        'completed';
-
-      job.completed_at =
-        now();
-
-
-      logger.info({
-        accountId,
-        jobId: job.id,
-        sent: job.sent,
-        failed: job.failed
-      }, 'Bulk job completed');
-
+         * Reconnect transient failures.
+         */
+        if (
+            !loggedOut &&
+            (
+                restartRequired ||
+                statusCode !==
+                    DisconnectReason.loggedOut
+            )
+        ) {
+            setTimeout(
+                () => {
+                    connectAccount(
+                        accountId
+                    ).catch(
+                        error => {
+                            updateAccount(
+                                accountId,
+                                {
+                                    status:
+                                        "error",
+                                    connected:
+                                        false,
+                                    last_error:
+                                        error.message
+                                }
+                            );
+                        }
+                    );
+                },
+                3000
+            );
+        }
     }
-
-  } finally {
-
-    session.processingBulk =
-      false;
-
-  }
 }
 
+/* =========================================================
+   MESSAGE EVENTS
+========================================================= */
 
-// ============================================================
-// AUTH MIDDLEWARE
-// ============================================================
-
-function authenticate(
-  req,
-  res,
-  next
+async function handleMessages(
+    accountId,
+    data
 ) {
-
-  const supplied =
-    req.headers['x-connector-token'] ||
-    req.headers.authorization
-      ?.replace(/^Bearer\s+/i, '');
-
-
-  if (
-    !supplied ||
-    supplied !== API_TOKEN
-  ) {
-
-    return fail(
-      res,
-      401,
-      'Unauthorized'
-    );
-  }
-
-
-  next();
-}
-
-
-// ============================================================
-// HEALTH
-// ============================================================
-
-app.get(
-  '/health',
-  (req, res) => {
-
-    return ok(
-      res,
-      {
-        service:
-          'RB WhatsApp Multi-Account Connector',
-
-        version:
-          '3.0.0',
-
-        uptime:
-          process.uptime(),
-
-        accounts:
-          Object.keys(
-            database.accounts
-          ).length,
-
-        active_sessions:
-          sessions.size,
-
-        time:
-          now()
-      }
-    );
-
-  }
-);
-
-
-// ============================================================
-// ALL API ROUTES REQUIRE TOKEN
-// ============================================================
-
-app.use(
-  '/api',
-  authenticate
-);
-
-
-// ============================================================
-// LIST ACCOUNTS
-// ============================================================
-
-app.get(
-  '/api/accounts',
-  (req, res) => {
-
-    const accounts =
-      Object.values(
-        database.accounts
-      )
-      .map(publicAccount);
-
-
-    return ok(
-      res,
-      {
-        accounts
-      }
-    );
-
-  }
-);
-
-
-// ============================================================
-// CREATE ACCOUNT
-// ============================================================
-
-app.post(
-  '/api/accounts',
-  (req, res) => {
-
-    try {
-
-      const accountId =
-        safeId(
-          req.body.account_id
-        );
-
-
-      if (!accountId) {
-
-        return fail(
-          res,
-          400,
-          'account_id is required'
-        );
-      }
-
-
-      const account =
-        createAccount(
-          accountId
-        );
-
-
-      return ok(
-        res,
-        {
-          account:
-            publicAccount(
-              account
-            )
-        }
-      );
-
-    } catch (error) {
-
-      return fail(
-        res,
-        400,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// ACCOUNT STATUS
-// ============================================================
-
-app.get(
-  '/api/accounts/:id/status',
-  (req, res) => {
-
-    const id =
-      safeId(
-        req.params.id
-      );
-
-
-    const account =
-      getAccount(id);
-
-
-    if (!account) {
-
-      return fail(
-        res,
-        404,
-        'Account not found'
-      );
-    }
-
-
-    return ok(
-      res,
-      {
-        account:
-          publicAccount(
-            account
-          )
-      }
-    );
-
-  }
-);
-
-
-// ============================================================
-// CONNECT
-// ============================================================
-
-app.post(
-  '/api/accounts/:id/connect',
-  async (req, res) => {
-
-    try {
-
-      const id =
-        safeId(
-          req.params.id
-        );
-
-
-      if (!id) {
-
-        return fail(
-          res,
-          400,
-          'Invalid account_id'
-        );
-      }
-
-
-      await connectAccount(id);
-
-
-      return ok(
-        res,
-        {
-          account:
-            publicAccount(
-              getAccount(id)
-            )
-        }
-      );
-
-    } catch (error) {
-
-      logger.error(error);
-
-      return fail(
-        res,
-        500,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// QR
-// ============================================================
-
-app.get(
-  '/api/accounts/:id/qr',
-  async (req, res) => {
-
-    try {
-
-      const id =
-        safeId(
-          req.params.id
-        );
-
-
-      const qr =
-        await getQR(id);
-
-
-      return ok(
-        res,
-        qr
-      );
-
-    } catch (error) {
-
-      return fail(
-        res,
-        404,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// PAIRING CODE
-// ============================================================
-
-app.post(
-  '/api/accounts/:id/pair',
-  async (req, res) => {
-
-    try {
-
-      const id =
-        safeId(
-          req.params.id
-        );
-
-
-      const phone =
-        normalizePhone(
-          req.body.phone
-        );
-
-
-      if (!phone) {
-
-        return fail(
-          res,
-          400,
-          'Valid phone is required'
-        );
-      }
-
-
-      const code =
-        await requestPairingCode(
-          id,
-          phone
-        );
-
-
-      return ok(
-        res,
-        {
-          pairing_code:
-            code
-        }
-      );
-
-    } catch (error) {
-
-      return fail(
-        res,
-        400,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// DISCONNECT
-// ============================================================
-
-app.post(
-  '/api/accounts/:id/disconnect',
-  async (req, res) => {
-
-    const id =
-      safeId(
-        req.params.id
-      );
-
-
-    const account =
-      getAccount(id);
-
-
-    if (!account) {
-
-      return fail(
-        res,
-        404,
-        'Account not found'
-      );
-    }
-
-
-    const session =
-      getSession(id);
-
-
-    try {
-
-      if (session?.sock) {
-
-        await session.sock.logout();
-
-      }
-
-    } catch (error) {
-
-      logger.warn(error);
-
-    }
-
-
-    sessions.delete(id);
-
-
-    updateAccount(id, {
-
-      status:
-        'disconnected',
-
-      connected:
-        false,
-
-      qr:
-        null,
-
-      qr_image:
-        null,
-
-      pairing_code:
-        null
-
-    });
-
-
-    return ok(
-      res,
-      {
-        account:
-          publicAccount(
-            getAccount(id)
-          )
-      }
-    );
-
-  }
-);
-
-
-// ============================================================
-// RESET ACCOUNT
-// ============================================================
-
-app.post(
-  '/api/accounts/:id/reset',
-  async (req, res) => {
-
-    const id =
-      safeId(
-        req.params.id
-      );
-
-
-    const account =
-      getAccount(id);
-
-
-    if (!account) {
-
-      return fail(
-        res,
-        404,
-        'Account not found'
-      );
-    }
-
-
-    const session =
-      getSession(id);
-
-
-    try {
-
-      if (session?.sock) {
-
-        try {
-          await session.sock.logout();
-        } catch (_) {}
-
-        try {
-          session.sock.end(
-            new Error(
-              'Reset'
-            )
-          );
-        } catch (_) {}
-
-      }
-
-    } catch (_) {}
-
-
-    sessions.delete(id);
-
-
-    const authPath =
-      getAuthPath(id);
-
-
-    /*
-      Delete only this account's session.
-    */
-
     if (
-      fs.existsSync(authPath)
+        !data ||
+        !Array.isArray(
+            data.messages
+        )
     ) {
-
-      fs.rmSync(
-        authPath,
-        {
-          recursive: true,
-          force: true
-        }
-      );
-
+        return;
     }
-
-
-    updateAccount(id, {
-
-      status:
-        'disconnected',
-
-      connected:
-        false,
-
-      phone:
-        null,
-
-      qr:
-        null,
-
-      qr_image:
-        null,
-
-      qr_expires_at:
-        null,
-
-      pairing_code:
-        null,
-
-      last_error:
-        null,
-
-      connected_at:
-        null
-
-    });
-
-
-    return ok(
-      res,
-      {
-        message:
-          'Account session reset'
-      }
-    );
-
-  }
-);
-
-
-// ============================================================
-// DELETE ACCOUNT
-// ============================================================
-
-app.delete(
-  '/api/accounts/:id',
-  async (req, res) => {
-
-    const id =
-      safeId(
-        req.params.id
-      );
-
-
-    if (
-      !database.accounts[id]
-    ) {
-
-      return fail(
-        res,
-        404,
-        'Account not found'
-      );
-    }
-
-
-    const session =
-      getSession(id);
-
-
-    try {
-
-      if (session?.sock) {
-
-        try {
-          await session.sock.logout();
-        } catch (_) {}
-
-      }
-
-    } catch (_) {}
-
-
-    sessions.delete(id);
-
-
-    const authPath =
-      getAuthPath(id);
-
-
-    if (
-      fs.existsSync(authPath)
-    ) {
-
-      fs.rmSync(
-        authPath,
-        {
-          recursive: true,
-          force: true
-        }
-      );
-
-    }
-
-
-    delete database.accounts[id];
-
-    saveDB();
-
-
-    return ok(
-      res,
-      {
-        message:
-          'Account deleted'
-      }
-    );
-
-  }
-);
-
-
-// ============================================================
-// SEND TEXT
-// ============================================================
-
-app.post(
-  '/api/send-message',
-  async (req, res) => {
-
-    try {
-
-      const accountId =
-        safeId(
-          req.body.account_id
-        );
-
-
-      const phone =
-        req.body.phone;
-
-
-      const message =
-        req.body.message;
-
-
-      if (!accountId) {
-
-        return fail(
-          res,
-          400,
-          'account_id is required'
-        );
-      }
-
-
-      const result =
-        await sendText(
-          accountId,
-          phone,
-          message
-        );
-
-
-      return ok(
-        res,
-        result
-      );
-
-    } catch (error) {
-
-      return fail(
-        res,
-        400,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// SEND MEDIA
-// ============================================================
-
-app.post(
-  '/api/send-media',
-  async (req, res) => {
-
-    try {
-
-      const accountId =
-        safeId(
-          req.body.account_id
-        );
-
-
-      const result =
-        await sendMedia(
-          accountId,
-          req.body.phone,
-          {
-            type:
-              req.body.type,
-
-            url:
-              req.body.url,
-
-            caption:
-              req.body.caption,
-
-            filename:
-              req.body.filename,
-
-            mimetype:
-              req.body.mimetype,
-
-            ptt:
-              req.body.ptt
-          }
-        );
-
-
-      return ok(
-        res,
-        result
-      );
-
-    } catch (error) {
-
-      return fail(
-        res,
-        400,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// BULK CREATE
-// ============================================================
-
-app.post(
-  '/api/bulk',
-  async (req, res) => {
-
-    try {
-
-      /*
-        Example:
-
-        {
-          "account_id": "account1",
-          "recipients": [
-            "919876543210",
-            "919123456789"
-          ],
-          "message": "Hello",
-          "delay_ms": 2000
-        }
-      */
-
-      const accountId =
-        safeId(
-          req.body.account_id
-        );
-
-
-      const job =
-        await createBulkJob(
-          accountId,
-
-          req.body.recipients,
-
-          req.body.message,
-
-          req.body.delay_ms
-        );
-
-
-      return ok(
-        res,
-        {
-          job_id:
-            job.id,
-
-          status:
-            job.status,
-
-          total:
-            job.total
-        }
-      );
-
-    } catch (error) {
-
-      return fail(
-        res,
-        400,
-        error.message
-      );
-
-    }
-
-  }
-);
-
-
-// ============================================================
-// BULK STATUS
-// ============================================================
-
-app.get(
-  '/api/bulk/:jobId',
-  (req, res) => {
-
-    const jobId =
-      req.params.jobId;
-
-
-    let found = null;
-
 
     for (
-      const session
-      of sessions.values()
+        const message of
+        data.messages
     ) {
+        try {
+            if (
+                !message ||
+                !message.key
+            ) {
+                continue;
+            }
 
-      const queued =
-        session.bulkQueue
-          .find(
-            job =>
-              job.id === jobId
-          );
+            const remoteJid =
+                message.key
+                    .remoteJid;
 
+            if (!remoteJid) {
+                continue;
+            }
 
-      if (queued) {
+            logEvent(
+                "message",
+                "WhatsApp message event",
+                {
+                    accountId,
+                    remoteJid,
+                    messageId:
+                        message.key.id ||
+                        null,
+                    fromMe:
+                        Boolean(
+                            message.key
+                                .fromMe
+                        )
+                }
+            );
 
-        found =
-          queued;
+        } catch (error) {
+            logger.error(
+                {
+                    error:
+                        error.message,
+                    accountId
+                },
+                "Message event failed"
+            );
+        }
+    }
+}
 
-        break;
-      }
+/* =========================================================
+   CREATE ACCOUNT
+========================================================= */
 
+function createAccount(
+    data
+) {
+    const requestedId =
+        safeString(
+            data.id
+        );
+
+    const id =
+        requestedId ||
+        makeId("wa");
+
+    if (accounts[id]) {
+        throw new Error(
+            "Account ID already exists"
+        );
     }
 
+    const account =
+        ensureAccountShape({
+            id,
 
-    if (!found) {
+            name:
+                safeString(
+                    data.name
+                ) ||
+                id,
 
-      return fail(
-        res,
-        404,
-        'Job not found or already completed'
-      );
+            phone:
+                normalizePhone(
+                    data.phone
+                ) ||
+                null,
 
+            status:
+                "disconnected",
+
+            connected: false,
+
+            qr: null,
+            qr_image: null,
+            qr_expires_at: null,
+            pairing_code: null,
+            connected_at: null,
+            last_error: null,
+
+            created_at: now(),
+            updated_at: now()
+        });
+
+    accounts[id] =
+        account;
+
+    saveAccounts();
+
+    return account;
+}
+
+/* =========================================================
+   DELETE ACCOUNT
+========================================================= */
+
+async function deleteAccount(
+    accountId,
+    deleteSession = true
+) {
+    const account =
+        getAccount(accountId);
+
+    if (!account) {
+        throw new Error(
+            "Account not found"
+        );
     }
 
+    const sock =
+        getSocket(accountId);
 
-    return ok(
-      res,
-      {
-        job:
-          found
-      }
+    if (sock) {
+        try {
+            sock.end(
+                undefined
+            );
+        } catch (_) {}
+    }
+
+    sockets.delete(
+        accountId
     );
 
-  }
-);
-
-
-// ============================================================
-// START EXISTING SESSIONS
-// ============================================================
-
-async function restoreSessions() {
-
-  const accounts =
-    Object.values(
-      database.accounts
+    connecting.delete(
+        accountId
     );
 
+    delete accounts[
+        accountId
+    ];
 
-  for (
-    const account
-    of accounts
-  ) {
+    saveAccounts();
 
     if (
-      account.enabled === false
+        deleteSession
     ) {
-      continue;
+        const folder =
+            accountFolder(
+                accountId
+            );
+
+        try {
+            fs.rmSync(
+                folder,
+                {
+                    recursive: true,
+                    force: true
+                }
+            );
+        } catch (error) {
+            logEvent(
+                "delete_session_error",
+                "Could not delete auth folder",
+                {
+                    accountId,
+                    error:
+                        error.message
+                }
+            );
+        }
     }
 
-
-    /*
-      Small delay between accounts
-      so a restart doesn't open every
-      socket at exactly the same time.
-    */
-
-    await sleep(1000);
-
-
-    try {
-
-      await connectAccount(
-        account.id
-      );
-
-    } catch (error) {
-
-      logger.error({
-        accountId:
-          account.id,
-
-        error
-
-      }, 'Failed to restore account');
-
-    }
-
-  }
-
+    return true;
 }
 
+/* =========================================================
+   SEND TEXT
+========================================================= */
 
-// ============================================================
-// ROOT
-// ============================================================
+async function sendText(
+    accountId,
+    phone,
+    message
+) {
+    const sock =
+        getSocket(accountId);
+
+    if (!sock) {
+        throw new Error(
+            "WhatsApp account is not connected"
+        );
+    }
+
+    const account =
+        getAccount(accountId);
+
+    if (
+        !account ||
+        !account.connected
+    ) {
+        throw new Error(
+            "WhatsApp account is not connected"
+        );
+    }
+
+    const number =
+        normalizePhone(phone);
+
+    if (!number) {
+        throw new Error(
+            "Invalid recipient phone"
+        );
+    }
+
+    const text =
+        safeString(message);
+
+    if (!text) {
+        throw new Error(
+            "Message is empty"
+        );
+    }
+
+    const jid =
+        phoneToJid(
+            number
+        );
+
+    const result =
+        await sock.sendMessage(
+            jid,
+            {
+                text
+            }
+        );
+
+    logEvent(
+        "send_text",
+        "Text message sent",
+        {
+            accountId,
+            phone: number,
+            messageId:
+                result?.key?.id ||
+                null
+        }
+    );
+
+    return {
+        success: true,
+        message_id:
+            result?.key?.id ||
+            null,
+        phone: number
+    };
+}
+
+/* =========================================================
+   MEDIA HELPERS
+========================================================= */
+
+function detectMime(
+    mime,
+    type
+) {
+    if (mime) {
+        return mime;
+    }
+
+    switch (
+        String(type || "")
+            .toLowerCase()
+    ) {
+        case "image":
+            return "image/jpeg";
+
+        case "video":
+            return "video/mp4";
+
+        case "audio":
+            return "audio/mpeg";
+
+        case "document":
+            return "application/octet-stream";
+
+        default:
+            return "application/octet-stream";
+    }
+}
+
+async function fetchMedia(
+    url
+) {
+    const controller =
+        new AbortController();
+
+    const timer =
+        setTimeout(
+            () =>
+                controller.abort(),
+            REQUEST_TIMEOUT
+        );
+
+    try {
+        const response =
+            await fetch(
+                url,
+                {
+                    signal:
+                        controller.signal
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `Media download failed: HTTP ${response.status}`
+            );
+        }
+
+        const contentType =
+            response.headers.get(
+                "content-type"
+            ) || "";
+
+        const arrayBuffer =
+            await response.arrayBuffer();
+
+        return {
+            buffer:
+                Buffer.from(
+                    arrayBuffer
+                ),
+
+            contentType
+        };
+
+    } finally {
+        clearTimeout(
+            timer
+        );
+    }
+}
+
+/* =========================================================
+   SEND MEDIA
+========================================================= */
+
+async function sendMedia(
+    accountId,
+    phone,
+    type,
+    url,
+    caption,
+    filename,
+    mime
+) {
+    const sock =
+        getSocket(accountId);
+
+    if (!sock) {
+        throw new Error(
+            "WhatsApp account is not connected"
+        );
+    }
+
+    const account =
+        getAccount(accountId);
+
+    if (
+        !account ||
+        !account.connected
+    ) {
+        throw new Error(
+            "WhatsApp account is not connected"
+        );
+    }
+
+    const number =
+        normalizePhone(phone);
+
+    if (!number) {
+        throw new Error(
+            "Invalid recipient phone"
+        );
+    }
+
+    if (!url) {
+        throw new Error(
+            "Media URL is required"
+        );
+    }
+
+    const mediaType =
+        String(type || "image")
+            .toLowerCase();
+
+    if (
+        ![
+            "image",
+            "video",
+            "audio",
+            "document"
+        ].includes(
+            mediaType
+        )
+    ) {
+        throw new Error(
+            "Unsupported media type"
+        );
+    }
+
+    const downloaded =
+        await fetchMedia(
+            url
+        );
+
+    const finalMime =
+        detectMime(
+            mime ||
+                downloaded.contentType,
+            mediaType
+        );
+
+    const jid =
+        phoneToJid(
+            number
+        );
+
+    let content;
+
+    if (
+        mediaType === "image"
+    ) {
+        content = {
+            image:
+                downloaded.buffer,
+            mimetype:
+                finalMime,
+            caption:
+                safeString(
+                    caption
+                ) || undefined
+        };
+    }
+
+    if (
+        mediaType === "video"
+    ) {
+        content = {
+            video:
+                downloaded.buffer,
+            mimetype:
+                finalMime,
+            caption:
+                safeString(
+                    caption
+                ) || undefined
+        };
+    }
+
+    if (
+        mediaType === "audio"
+    ) {
+        content = {
+            audio:
+                downloaded.buffer,
+            mimetype:
+                finalMime,
+            ptt: false
+        };
+    }
+
+    if (
+        mediaType === "document"
+    ) {
+        content = {
+            document:
+                downloaded.buffer,
+            mimetype:
+                finalMime,
+            fileName:
+                safeString(
+                    filename
+                ) ||
+                "document"
+        };
+
+        if (
+            safeString(
+                caption
+            )
+        ) {
+            content.caption =
+                safeString(
+                    caption
+                );
+        }
+    }
+
+    const result =
+        await sock.sendMessage(
+            jid,
+            content
+        );
+
+    logEvent(
+        "send_media",
+        "Media message sent",
+        {
+            accountId,
+            phone: number,
+            type: mediaType,
+            messageId:
+                result?.key?.id ||
+                null
+        }
+    );
+
+    return {
+        success: true,
+        message_id:
+            result?.key?.id ||
+            null,
+        phone: number,
+        type: mediaType
+    };
+}
+
+/* =========================================================
+   BULK HELPERS
+========================================================= */
+
+function normalizeRecipients(
+    recipients
+) {
+    if (
+        !Array.isArray(
+            recipients
+        )
+    ) {
+        return [];
+    }
+
+    const unique =
+        new Set();
+
+    for (
+        const item of recipients
+    ) {
+        const phone =
+            normalizePhone(
+                typeof item ===
+                    "object"
+                    ? item.phone
+                    : item
+            );
+
+        if (
+            phone &&
+            phone.length >= 8
+        ) {
+            unique.add(
+                phone
+            );
+        }
+    }
+
+    return Array.from(
+        unique
+    );
+}
+
+function createBulkJob(
+    data
+) {
+    const id =
+        makeId("job");
+
+    const recipients =
+        normalizeRecipients(
+            data.recipients
+        );
+
+    const job = {
+        id,
+
+        account_id:
+            data.account_id,
+
+        total:
+            recipients.length,
+
+        sent: 0,
+
+        failed: 0,
+
+        remaining:
+            recipients.length,
+
+        status: "queued",
+
+        message:
+            safeString(
+                data.message
+            ),
+
+        delay:
+            Math.max(
+                1000,
+                Number(
+                    data.delay ||
+                    DEFAULT_BULK_DELAY
+                )
+            ),
+
+        recipients,
+
+        results: [],
+
+        created_at: now(),
+
+        started_at: null,
+
+        completed_at: null,
+
+        error: null
+    };
+
+    jobs[id] = job;
+
+    saveJobs();
+
+    return job;
+}
+
+/* =========================================================
+   BULK PROCESSOR
+========================================================= */
+
+async function processBulkJob(
+    jobId
+) {
+    const job =
+        jobs[jobId];
+
+    if (!job) {
+        return;
+    }
+
+    if (
+        bulkRunning.has(
+            jobId
+        )
+    ) {
+        return;
+    }
+
+    bulkRunning.set(
+        jobId,
+        true
+    );
+
+    job.status =
+        "running";
+
+    job.started_at =
+        now();
+
+    saveJobs();
+
+    try {
+        for (
+            let i = 0;
+            i < job.recipients.length;
+            i++
+        ) {
+            const phone =
+                job.recipients[i];
+
+            try {
+                const result =
+                    await sendText(
+                        job.account_id,
+                        phone,
+                        job.message
+                    );
+
+                job.sent++;
+
+                job.results.push({
+                    phone,
+                    success: true,
+                    message_id:
+                        result.message_id,
+                    at: now()
+                });
+
+            } catch (error) {
+                job.failed++;
+
+                job.results.push({
+                    phone,
+                    success: false,
+                    error:
+                        error.message,
+                    at: now()
+                });
+            }
+
+            job.remaining =
+                job.total -
+                job.sent -
+                job.failed;
+
+            saveJobs();
+
+            /*
+             * Do not use ultra-fast sending.
+             * Minimum 1000ms.
+             */
+            if (
+                i <
+                job.recipients.length -
+                    1
+            ) {
+                await sleep(
+                    Math.max(
+                        1000,
+                        job.delay
+                    )
+                );
+            }
+        }
+
+        job.status =
+            "completed";
+
+        job.completed_at =
+            now();
+
+        job.remaining = 0;
+
+        saveJobs();
+
+        logEvent(
+            "bulk_complete",
+            "Bulk job completed",
+            {
+                jobId,
+                accountId:
+                    job.account_id,
+                total:
+                    job.total,
+                sent:
+                    job.sent,
+                failed:
+                    job.failed
+            }
+        );
+
+    } catch (error) {
+        job.status =
+            "failed";
+
+        job.error =
+            error.message;
+
+        job.completed_at =
+            now();
+
+        saveJobs();
+
+        logEvent(
+            "bulk_failed",
+            "Bulk job failed",
+            {
+                jobId,
+                error:
+                    error.message
+            }
+        );
+
+    } finally {
+        bulkRunning.delete(
+            jobId
+        );
+    }
+}
+
+/* =========================================================
+   HEALTH
+========================================================= */
 
 app.get(
-  '/',
-  (req, res) => {
+    "/health",
+    (req, res) => {
+        res.json({
+            success: true,
 
-    res.json({
+            status: "ok",
 
-      success: true,
+            service:
+                "RB WhatsApp Connector",
 
-      service:
-        'RB WhatsApp Multi-Account Connector',
+            version: "2.0.0",
 
-      version:
-        '3.0.0',
+            node:
+                process.version,
 
-      endpoints: {
+            uptime:
+                process.uptime(),
 
-        health:
-          'GET /health',
+            accounts:
+                Object.keys(
+                    accounts
+                ).length,
 
-        accounts:
-          'GET /api/accounts',
+            connected:
+                Object.values(
+                    accounts
+                ).filter(
+                    a =>
+                        a.connected
+                ).length,
 
-        create_account:
-          'POST /api/accounts',
-
-        connect:
-          'POST /api/accounts/:id/connect',
-
-        qr:
-          'GET /api/accounts/:id/qr',
-
-        pairing:
-          'POST /api/accounts/:id/pair',
-
-        status:
-          'GET /api/accounts/:id/status',
-
-        disconnect:
-          'POST /api/accounts/:id/disconnect',
-
-        reset:
-          'POST /api/accounts/:id/reset',
-
-        delete:
-          'DELETE /api/accounts/:id',
-
-        send:
-          'POST /api/send-message',
-
-        media:
-          'POST /api/send-media',
-
-        bulk:
-          'POST /api/bulk',
-
-        bulk_status:
-          'GET /api/bulk/:jobId'
-
-      }
-
-    });
-
-  }
-);
-
-
-// ============================================================
-// ERROR HANDLER
-// ============================================================
-
-app.use(
-  (err, req, res, next) => {
-
-    logger.error(err);
-
-    return fail(
-      res,
-      500,
-      'Internal server error'
-    );
-
-  }
-);
-
-
-// ============================================================
-// SERVER
-// ============================================================
-
-app.listen(
-  PORT,
-  async () => {
-
-    logger.info(
-      `RB WhatsApp connector running on port ${PORT}`
-    );
-
-    logger.info(
-      `Accounts directory: ${AUTH_DIR}`
-    );
-
-
-    await restoreSessions();
-
-  }
-);
-
-
-// ============================================================
-// GRACEFUL SHUTDOWN
-// ============================================================
-
-async function shutdown(
-  signal
-) {
-
-  logger.info(
-    `${signal}: shutting down`
-  );
-
-
-  for (
-    const [
-      accountId,
-      session
-    ]
-    of sessions.entries()
-  ) {
-
-    try {
-
-      if (
-        session.reconnectTimer
-      ) {
-
-        clearTimeout(
-          session.reconnectTimer
-        );
-
-      }
-
-
-      if (
-        session.sock
-      ) {
-
-        session.sock.end(
-          new Error(
-            'Server shutdown'
-          )
-        );
-
-      }
-
-    } catch (error) {
-
-      logger.error({
-        accountId,
-        error
-      });
-
+            time: now()
+        });
     }
+);
 
-  }
+/* =========================================================
+   ACCOUNT LIST
+========================================================= */
 
+app.get(
+    "/api/accounts",
+    (req, res) => {
+        const list =
+            Object.values(
+                accounts
+            ).map(
+                publicAccount
+            );
 
-  process.exit(0);
+        res.json({
+            success: true,
+            accounts: list,
+            total: list.length
+        });
+    }
+);
 
+/* =========================================================
+   GET SINGLE ACCOUNT
+========================================================= */
+
+app.get(
+    "/api/accounts/:id",
+    (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        res.json({
+            success: true,
+            account:
+                publicAccount(
+                    account
+                )
+        });
+    }
+);
+
+/* =========================================================
+   CREATE ACCOUNT
+========================================================= */
+
+app.post(
+    "/api/accounts",
+    (req, res) => {
+        try {
+            const account =
+                createAccount(
+                    req.body || {}
+                );
+
+            res.json({
+                success: true,
+                account:
+                    publicAccount(
+                        account
+                    )
+            });
+
+        } catch (error) {
+            res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   ACCOUNT STATUS
+========================================================= */
+
+app.get(
+    "/api/accounts/:id/status",
+    (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        res.json({
+            success: true,
+
+            account:
+                publicAccount(
+                    account
+                )
+        });
+    }
+);
+
+/* =========================================================
+   CONNECT
+========================================================= */
+
+app.post(
+    "/api/accounts/:id/connect",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        try {
+            await connectAccount(
+                account.id
+            );
+
+            res.json({
+                success: true,
+                account:
+                    publicAccount(
+                        getAccount(
+                            account.id
+                        )
+                    )
+            });
+
+        } catch (error) {
+            res.status(500)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   QR
+========================================================= */
+
+app.get(
+    "/api/accounts/:id/qr",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        /*
+         * If socket isn't running,
+         * start it.
+         */
+        if (
+            !getSocket(
+                account.id
+            )
+        ) {
+            try {
+                await connectAccount(
+                    account.id
+                );
+            } catch (_) {}
+        }
+
+        res.json({
+            success: true,
+
+            account_id:
+                account.id,
+
+            qr:
+                account.qr ||
+                null,
+
+            qr_image:
+                account.qr_image ||
+                null,
+
+            qr_expires_at:
+                account.qr_expires_at ||
+                null,
+
+            available:
+                Boolean(
+                    account.qr
+                )
+        });
+    }
+);
+
+/* =========================================================
+   PAIRING CODE
+========================================================= */
+
+app.post(
+    "/api/accounts/:id/pair",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        const phone =
+            normalizePhone(
+                req.body?.phone
+            );
+
+        if (
+            !phone ||
+            phone.length < 8
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "Valid phone number is required"
+                });
+        }
+
+        try {
+            let sock =
+                getSocket(
+                    account.id
+                );
+
+            if (!sock) {
+                await connectAccount(
+                    account.id
+                );
+
+                await sleep(
+                    1500
+                );
+
+                sock =
+                    getSocket(
+                        account.id
+                    );
+            }
+
+            if (!sock) {
+                throw new Error(
+                    "Could not initialize WhatsApp socket"
+                );
+            }
+
+            if (
+                sock.authState &&
+                sock.authState.creds &&
+                sock.authState.creds
+                    .registered
+            ) {
+                return res.status(400)
+                    .json({
+                        success: false,
+                        error:
+                            "Account is already registered"
+                    });
+            }
+
+            /*
+             * Baileys pairing code
+             * requires digits only
+             * with country code.
+             */
+            const code =
+                await sock.requestPairingCode(
+                    phone
+                );
+
+            updateAccount(
+                account.id,
+                {
+                    phone,
+                    pairing_code:
+                        code,
+                    status:
+                        "pairing",
+                    connected:
+                        false,
+                    qr: null,
+                    qr_image: null,
+                    qr_expires_at:
+                        null
+                }
+            );
+
+            res.json({
+                success: true,
+
+                account_id:
+                    account.id,
+
+                phone,
+
+                pairing_code:
+                    code
+            });
+
+        } catch (error) {
+            updateAccount(
+                account.id,
+                {
+                    status: "error",
+                    last_error:
+                        error.message
+                }
+            );
+
+            res.status(500)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   DISCONNECT
+========================================================= */
+
+app.post(
+    "/api/accounts/:id/disconnect",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        const sock =
+            getSocket(
+                account.id
+            );
+
+        try {
+            if (sock) {
+                try {
+                    sock.end(
+                        undefined
+                    );
+                } catch (_) {}
+            }
+
+            sockets.delete(
+                account.id
+            );
+
+            connecting.delete(
+                account.id
+            );
+
+            updateAccount(
+                account.id,
+                {
+                    status:
+                        "disconnected",
+                    connected:
+                        false,
+                    qr: null,
+                    qr_image: null,
+                    qr_expires_at:
+                        null,
+                    pairing_code:
+                        null
+                }
+            );
+
+            res.json({
+                success: true,
+                account:
+                    publicAccount(
+                        getAccount(
+                            account.id
+                        )
+                    )
+            });
+
+        } catch (error) {
+            res.status(500)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   RESET SESSION
+========================================================= */
+
+app.post(
+    "/api/accounts/:id/reset",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        try {
+            const sock =
+                getSocket(
+                    account.id
+                );
+
+            if (sock) {
+                try {
+                    sock.logout();
+                } catch (_) {}
+
+                try {
+                    sock.end(
+                        undefined
+                    );
+                } catch (_) {}
+            }
+
+            sockets.delete(
+                account.id
+            );
+
+            connecting.delete(
+                account.id
+            );
+
+            const folder =
+                accountFolder(
+                    account.id
+                );
+
+            try {
+                fs.rmSync(
+                    folder,
+                    {
+                        recursive: true,
+                        force: true
+                    }
+                );
+            } catch (_) {}
+
+            updateAccount(
+                account.id,
+                {
+                    phone: null,
+                    status:
+                        "disconnected",
+                    connected:
+                        false,
+                    qr: null,
+                    qr_image: null,
+                    qr_expires_at:
+                        null,
+                    pairing_code:
+                        null,
+                    connected_at:
+                        null,
+                    last_error:
+                        null
+                }
+            );
+
+            res.json({
+                success: true,
+
+                message:
+                    "Account session reset",
+
+                account:
+                    publicAccount(
+                        getAccount(
+                            account.id
+                        )
+                    )
+            });
+
+        } catch (error) {
+            res.status(500)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   DELETE ACCOUNT
+========================================================= */
+
+app.delete(
+    "/api/accounts/:id",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        try {
+            await deleteAccount(
+                account.id,
+                true
+            );
+
+            res.json({
+                success: true,
+                message:
+                    "Account deleted"
+            });
+
+        } catch (error) {
+            res.status(500)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   SEND MESSAGE
+========================================================= */
+
+app.post(
+    "/api/send-message",
+    async (req, res) => {
+        const {
+            account_id,
+            phone,
+            message
+        } = req.body || {};
+
+        if (!account_id) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "account_id is required"
+                });
+        }
+
+        try {
+            const result =
+                await sendText(
+                    account_id,
+                    phone,
+                    message
+                );
+
+            res.json({
+                success: true,
+
+                account_id,
+
+                phone:
+                    result.phone,
+
+                message_id:
+                    result.message_id
+            });
+
+        } catch (error) {
+            res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   SEND MEDIA
+========================================================= */
+
+app.post(
+    "/api/send-media",
+    async (req, res) => {
+        const {
+            account_id,
+            phone,
+            type,
+            url,
+            caption,
+            filename,
+            mime
+        } = req.body || {};
+
+        if (!account_id) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "account_id is required"
+                });
+        }
+
+        try {
+            const result =
+                await sendMedia(
+                    account_id,
+                    phone,
+                    type,
+                    url,
+                    caption,
+                    filename,
+                    mime
+                );
+
+            res.json({
+                success: true,
+
+                account_id,
+
+                phone:
+                    result.phone,
+
+                type:
+                    result.type,
+
+                message_id:
+                    result.message_id
+            });
+
+        } catch (error) {
+            res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/* =========================================================
+   BULK SEND
+========================================================= */
+
+app.post(
+    "/api/bulk",
+    async (req, res) => {
+        const {
+            account_id,
+            recipients,
+            message,
+            delay
+        } = req.body || {};
+
+        if (!account_id) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "account_id is required"
+                });
+        }
+
+        if (
+            !Array.isArray(
+                recipients
+            )
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "recipients must be an array"
+                });
+        }
+
+        const normalized =
+            normalizeRecipients(
+                recipients
+            );
+
+        if (
+            !normalized.length
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "No valid recipients"
+                });
+        }
+
+        if (
+            normalized.length >
+            MAX_BULK_RECIPIENTS
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+
+                    error:
+                        `Maximum ${MAX_BULK_RECIPIENTS} recipients per job`
+                });
+        }
+
+        if (
+            !safeString(
+                message
+            )
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "Message is required"
+                });
+        }
+
+        const account =
+            getAccount(
+                account_id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        if (
+            !account.connected
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "Account is not connected"
+                });
+        }
+
+        const job =
+            createBulkJob({
+                account_id,
+                recipients:
+                    normalized,
+                message,
+                delay:
+                    Math.max(
+                        1000,
+                        Number(
+                            delay ||
+                            DEFAULT_BULK_DELAY
+                        )
+                    )
+            });
+
+        /*
+         * Start asynchronously.
+         */
+        processBulkJob(
+            job.id
+        ).catch(
+            error => {
+                logger.error(
+                    {
+                        jobId:
+                            job.id,
+                        error:
+                            error.message
+                    },
+                    "Bulk processor error"
+                );
+            }
+        );
+
+        res.json({
+            success: true,
+
+            job_id:
+                job.id,
+
+            status:
+                job.status,
+
+            total:
+                job.total,
+
+            sent:
+                job.sent,
+
+            failed:
+                job.failed,
+
+            remaining:
+                job.remaining,
+
+            delay:
+                job.delay
+        });
+    }
+);
+
+/* =========================================================
+   BULK STATUS
+========================================================= */
+
+app.get(
+    "/api/bulk/:jobId",
+    (req, res) => {
+        const job =
+            jobs[
+                req.params.jobId
+            ];
+
+        if (!job) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Bulk job not found"
+                });
+        }
+
+        res.json({
+            success: true,
+
+            job: {
+                id: job.id,
+
+                account_id:
+                    job.account_id,
+
+                status:
+                    job.status,
+
+                total:
+                    job.total,
+
+                sent:
+                    job.sent,
+
+                failed:
+                    job.failed,
+
+                remaining:
+                    job.remaining,
+
+                delay:
+                    job.delay,
+
+                created_at:
+                    job.created_at,
+
+                started_at:
+                    job.started_at,
+
+                completed_at:
+                    job.completed_at,
+
+                error:
+                    job.error
+            }
+        });
+    }
+);
+
+/* =========================================================
+   BULK JOB LIST
+========================================================= */
+
+app.get(
+    "/api/bulk",
+    (req, res) => {
+        const list =
+            Object.values(
+                jobs
+            )
+                .sort(
+                    (a, b) =>
+                        new Date(
+                            b.created_at
+                        ) -
+                        new Date(
+                            a.created_at
+                        )
+                )
+                .slice(0, 100)
+                .map(job => ({
+                    id: job.id,
+
+                    account_id:
+                        job.account_id,
+
+                    status:
+                        job.status,
+
+                    total:
+                        job.total,
+
+                    sent:
+                        job.sent,
+
+                    failed:
+                        job.failed,
+
+                    remaining:
+                        job.remaining,
+
+                    created_at:
+                        job.created_at,
+
+                    started_at:
+                        job.started_at,
+
+                    completed_at:
+                        job.completed_at
+                }));
+
+        res.json({
+            success: true,
+            jobs: list
+        });
+    }
+);
+
+/* =========================================================
+   DELETE OLD JOBS
+========================================================= */
+
+app.delete(
+    "/api/bulk/:jobId",
+    (req, res) => {
+        const id =
+            req.params.jobId;
+
+        if (!jobs[id]) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Bulk job not found"
+                });
+        }
+
+        if (
+            bulkRunning.has(id)
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "Cannot delete a running job"
+                });
+        }
+
+        delete jobs[id];
+
+        saveJobs();
+
+        res.json({
+            success: true,
+            message:
+                "Bulk job deleted"
+        });
+    }
+);
+
+/* =========================================================
+   RESET ALL JOBS
+========================================================= */
+
+app.delete(
+    "/api/bulk",
+    (req, res) => {
+        for (
+            const id of
+            bulkRunning.keys()
+        ) {
+            return res.status(400)
+                .json({
+                    success: false,
+                    error:
+                        "Cannot clear jobs while a job is running"
+                });
+        }
+
+        jobs = {};
+
+        saveJobs();
+
+        res.json({
+            success: true,
+            message:
+                "Bulk jobs cleared"
+        });
+    }
+);
+
+/* =========================================================
+   PING ACCOUNT
+========================================================= */
+
+app.get(
+    "/api/accounts/:id/ping",
+    async (req, res) => {
+        const account =
+            getAccount(
+                req.params.id
+            );
+
+        if (!account) {
+            return res.status(404)
+                .json({
+                    success: false,
+                    error:
+                        "Account not found"
+                });
+        }
+
+        const sock =
+            getSocket(
+                account.id
+            );
+
+        res.json({
+            success: true,
+
+            account_id:
+                account.id,
+
+            socket:
+                Boolean(sock),
+
+            connected:
+                Boolean(
+                    account.connected
+                ),
+
+            phone:
+                account.phone ||
+                null,
+
+            status:
+                account.status
+        });
+    }
+);
+
+/* =========================================================
+   CONNECT ALL SAVED ACCOUNTS
+========================================================= */
+
+async function autoConnectAccounts() {
+    const list =
+        Object.values(
+            accounts
+        );
+
+    for (
+        const account of list
+    ) {
+        try {
+            consoleLogger.info(
+                `Restoring account: ${account.id}`
+            );
+
+            await connectAccount(
+                account.id
+            );
+
+            /*
+             * Small gap between
+             * restoring accounts.
+             */
+            await sleep(1200);
+
+        } catch (error) {
+            updateAccount(
+                account.id,
+                {
+                    status: "error",
+                    connected: false,
+                    last_error:
+                        error.message
+                }
+            );
+
+            consoleLogger.error(
+                {
+                    accountId:
+                        account.id,
+                    error:
+                        error.message
+                },
+                "Account restore failed"
+            );
+        }
+    }
 }
 
+/* =========================================================
+   CLEAN OLD QR DATA
+========================================================= */
+
+setInterval(
+    () => {
+        const current =
+            Date.now();
+
+        for (
+            const account of
+            Object.values(
+                accounts
+            )
+        ) {
+            if (
+                account.qr_expires_at
+            ) {
+                const expires =
+                    new Date(
+                        account.qr_expires_at
+                    ).getTime();
+
+                if (
+                    expires <= current
+                ) {
+                    clearQRCode(
+                        account.id
+                    );
+
+                    if (
+                        account.status ===
+                        "qr"
+                    ) {
+                        updateAccount(
+                            account.id,
+                            {
+                                status:
+                                    "connecting"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    },
+    10000
+);
+
+/* =========================================================
+   CLEAN OLD JOBS
+========================================================= */
+
+setInterval(
+    () => {
+        const cutoff =
+            Date.now() -
+            7 *
+                24 *
+                60 *
+                60 *
+                1000;
+
+        let changed =
+            false;
+
+        for (
+            const [
+                id,
+                job
+            ] of Object.entries(
+                jobs
+            )
+        ) {
+            if (
+                bulkRunning.has(
+                    id
+                )
+            ) {
+                continue;
+            }
+
+            const time =
+                new Date(
+                    job.created_at
+                ).getTime();
+
+            if (
+                time < cutoff
+            ) {
+                delete jobs[id];
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            saveJobs();
+        }
+    },
+    60 *
+        60 *
+        1000
+);
+
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
+
+app.use(
+    (err, req, res, next) => {
+        logger.error(
+            {
+                error:
+                    err?.message ||
+                    String(err),
+                path:
+                    req.path
+            },
+            "Unhandled request error"
+        );
+
+        if (
+            res.headersSent
+        ) {
+            return next(err);
+        }
+
+        res.status(500)
+            .json({
+                success: false,
+                error:
+                    "Internal server error"
+            });
+    }
+);
+
+/* =========================================================
+   START SERVER
+========================================================= */
+
+const server =
+    app.listen(
+        PORT,
+        "0.0.0.0",
+        async () => {
+            consoleLogger.info(
+                "========================================"
+            );
+
+            consoleLogger.info(
+                " RB WhatsApp Connector v2.0.0"
+            );
+
+            consoleLogger.info(
+                ` Port: ${PORT}`
+            );
+
+            consoleLogger.info(
+                ` Accounts: ${
+                    Object.keys(
+                        accounts
+                    ).length
+                }`
+            );
+
+            consoleLogger.info(
+                ` Node: ${process.version}`
+            );
+
+            consoleLogger.info(
+                "========================================"
+            );
+
+            await autoConnectAccounts();
+        }
+    );
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(
+    signal
+) {
+    consoleLogger.info(
+        `${signal} received. Shutting down...`
+    );
+
+    for (
+        const [
+            accountId,
+            sock
+        ] of sockets.entries()
+    ) {
+        try {
+            sock.end(
+                undefined
+            );
+        } catch (_) {}
+
+        sockets.delete(
+            accountId
+        );
+    }
+
+    server.close(
+        () => {
+            process.exit(0);
+        }
+    );
+
+    setTimeout(
+        () => {
+            process.exit(0);
+        },
+        5000
+    );
+}
 
 process.on(
-  'SIGTERM',
-  () => shutdown('SIGTERM')
+    "SIGTERM",
+    () =>
+        shutdown(
+            "SIGTERM"
+        )
 );
 
 process.on(
-  'SIGINT',
-  () => shutdown('SIGINT')
+    "SIGINT",
+    () =>
+        shutdown(
+            "SIGINT"
+        )
+);
+
+process.on(
+    "uncaughtException",
+    error => {
+        logger.fatal(
+            {
+                error:
+                    error.message,
+                stack:
+                    error.stack
+            },
+            "Uncaught exception"
+        );
+    }
+);
+
+process.on(
+    "unhandledRejection",
+    reason => {
+        logger.error(
+            {
+                error:
+                    String(reason)
+            },
+            "Unhandled rejection"
+        );
+    }
 );
