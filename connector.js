@@ -1,5 +1,5 @@
 'use strict';
-/* WhatsApp Connector — runs on Railway/Render/Fly. PHP panel talks to it over HTTPS. */
+/* WhatsApp Connector — QR + Pairing Code. Runs on Railway. */
 
 const express = require('express');
 const QRCode  = require('qrcode');
@@ -26,8 +26,11 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 const state = {
-  status: 'disconnected', phone: '', name: '', connected_at: 0,
-  qr: '', qr_expires_at: 0, last_error: '',
+  status: 'disconnected',
+  phone: '', name: '', connected_at: 0,
+  qr: '', qr_expires_at: 0,
+  pairing_code: '', pairing_phone: '', pairing_expires_at: 0,
+  last_error: '',
 };
 
 let sock = null, starting = false, stopRequested = false, reconnectTimer = null;
@@ -36,6 +39,9 @@ function setStatus(s, extra = {}) {
   state.status = s;
   Object.assign(state, extra);
   if (s !== 'qr') { state.qr = ''; state.qr_expires_at = 0; }
+  if (s === 'connected' || s === 'disconnected') {
+    state.pairing_code = ''; state.pairing_phone = ''; state.pairing_expires_at = 0;
+  }
   logger.info({ status: s, phone: state.phone }, 'state changed');
 }
 
@@ -71,6 +77,8 @@ async function startSocket() {
       browser: ['WA Panel', 'Chrome', '1.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: true,
+      connectTimeoutMs: 60000,
+      qrTimeout: 60000,
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -81,14 +89,16 @@ async function startSocket() {
         try {
           state.qr = await QRCode.toDataURL(qr, { margin: 1, width: 512 });
           state.qr_expires_at = nowSec() + 45;
-          setStatus('qr');
+          if (state.status !== 'pairing') setStatus('qr');
         } catch (e) { logger.error({ e: e.message }, 'qr encode failed'); }
       }
       if (connection === 'open') {
         const user = sock?.user || {};
         const phone = (user.id || '').split(':')[0].split('@')[0];
-        setStatus('connected', { phone, name: user.name || user.verifiedName || '',
-          connected_at: nowSec(), last_error: '' });
+        setStatus('connected', {
+          phone, name: user.name || user.verifiedName || '',
+          connected_at: nowSec(), last_error: '',
+        });
         forwardToPanel('whatsapp.connected', { phone, name: user.name || '' });
       }
       if (connection === 'close') {
@@ -141,6 +151,16 @@ async function disconnectSocket() {
   setStatus('disconnected', { phone: '', name: '', connected_at: 0, last_error: '' });
 }
 
+async function waitForSock(maxMs = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    if (sock && sock.ws && sock.ws.readyState === 1) return true;
+    if (sock && sock.authState && sock.authState.creds && !sock.authState.creds.registered) return true;
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return !!sock;
+}
+
 async function sendOne(payload) {
   if (!sock || state.status !== 'connected') {
     const e = new Error('WhatsApp is not connected'); e.code = 'WHATSAPP_NOT_CONNECTED'; throw e;
@@ -183,7 +203,13 @@ async function sendOne(payload) {
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Connector-Token');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use((req, res, next) => {
   if (!API_TOKEN) return next();
   const hdr = req.headers['authorization'] || '';
@@ -197,17 +223,23 @@ const ok   = (res, x = {}) => res.json({ success: true, ...x });
 const fail = (res, m, c = 'ERROR', h = 400) =>
   res.status(h).json({ success: false, error: { code: c, message: m } });
 
-app.get('/', (_r, r) => r.json({ service: 'wa-connector', version: '1.0.0', status: state.status }));
-app.get('/status', (_r, r) => ok(r, { status: state.status, phone: state.phone, name: state.name,
-  connected_at: state.connected_at, last_error: state.last_error }));
+app.get('/', (_r, r) => r.json({ service: 'wa-connector', version: '1.1.0', status: state.status }));
+app.get('/status', (_r, r) => ok(r, {
+  status: state.status, phone: state.phone, name: state.name,
+  connected_at: state.connected_at, last_error: state.last_error,
+  pairing_code: state.pairing_code, pairing_phone: state.pairing_phone,
+  pairing_expires_at: state.pairing_expires_at,
+}));
 app.get('/qr', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   if (state.qr) return ok(r, { status: 'qr', qr: state.qr, expires_at: state.qr_expires_at });
   startSocket().catch(() => {});
-  ok(r, { status: state.status === 'disconnected' ? 'connecting' : state.status, qr: '' });
+  await waitForSock(3000);
+  ok(r, { status: state.status === 'disconnected' ? 'connecting' : state.status, qr: state.qr });
 });
 app.post('/connect', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
+  state.pairing_code = ''; state.pairing_phone = '';
   startSocket().catch(() => {});
   ok(r, { status: 'connecting' });
 });
@@ -215,6 +247,34 @@ app.post('/disconnect', async (_r, r) => {
   try { await disconnectSocket(); ok(r, { status: 'disconnected' }); }
   catch (e) { fail(r, e.message, 'DISCONNECT_FAILED', 500); }
 });
+
+app.post('/pair', async (req, res) => {
+  const phone = String(req.body.phone || '').replace(/\D/g, '');
+  if (!phone || phone.length < 8) return fail(res, 'Enter phone with country code, e.g. 919876543210', 'INVALID_PHONE', 422);
+  if (state.status === 'connected') return fail(res, 'Already connected', 'ALREADY_CONNECTED', 409);
+
+  try {
+    // Wipe any stale auth so pairing starts clean
+    if (!sock) {
+      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+      await startSocket();
+    }
+    const ready = await waitForSock(10000);
+    if (!ready || !sock) return fail(res, 'Socket not ready — try again in a few seconds', 'SOCKET_NOT_READY', 503);
+
+    const code = await sock.requestPairingCode(phone);
+    state.pairing_code = code;
+    state.pairing_phone = phone;
+    state.pairing_expires_at = nowSec() + 300;
+    state.status = 'pairing';
+    logger.info({ phone, code }, 'pairing code generated');
+    ok(res, { code, phone, expires_at: state.pairing_expires_at });
+  } catch (e) {
+    logger.error({ e: e.message }, 'pair failed');
+    fail(res, e.message || 'Pairing failed', 'PAIR_FAILED', 500);
+  }
+});
+
 async function handleSend(req, res) {
   try { const id = await sendOne(req.body || {}); ok(res, { message_id: id, status: 'sent' }); }
   catch (e) {
