@@ -1,18 +1,23 @@
 {
-  "name": "rb-whatsapp-connector",
-  "version": "2.0.0",
-  "description": "RB multi-account WhatsApp Baileys connector",
+  "name": "wa-connector",
+  "version": "3.0.0",
+  "description": "Fast WhatsApp connector using Baileys",
   "main": "connector.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node connector.js"
+    "start": "node connector.js",
+    "dev": "node connector.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.20",
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "cors": "^2.8.5",
     "express": "^5.1.0",
-    "pino": "^9.7.0",
+    "libphonenumber-js": "^1.12.27",
+    "pino": "^9.9.0",
     "qrcode": "^1.5.4"
   }
 }
