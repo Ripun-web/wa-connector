@@ -1,19 +1,22 @@
 {
-  "name": "rb-whatsapp-multi-connector",
-  "version": "3.0.0",
-  "description": "Multi-account WhatsApp connector using Baileys",
+  "name": "rb-whatsapp-connector",
+  "version": "2.0.0",
+  "description": "Multi-account WhatsApp connector for RB WhatsApp Panel",
+  "type": "module",
   "main": "connector.js",
   "scripts": {
-    "start": "node connector.js"
+    "start": "node connector.js",
+    "dev": "node --watch connector.js"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "latest",
+    "@whiskeysockets/baileys": "^7.0.0-rc.14",
+    "cors": "^2.8.5",
     "express": "^5.1.0",
-    "pino": "^9.0.0",
+    "pino": "^9.7.0",
     "qrcode": "^1.5.4"
   }
 }
