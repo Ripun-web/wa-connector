@@ -1,28 +1,23 @@
 {
   "name": "wa-connector",
-  "version": "1.0.0",
-  "description": "WhatsApp API Connector using Baileys + Express — production-ready for Railway",
+  "version": "3.0.0",
+  "description": "Fast WhatsApp connector using Baileys",
   "main": "connector.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node connector.js"
+    "start": "node connector.js",
+    "dev": "node connector.js"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^7.0.0-rc14",
-    "express": "^4.21.0",
-    "pino": "^9.5.0",
-    "pino-pretty": "^13.0.0",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "libphonenumber-js": "^1.12.27",
+    "pino": "^9.9.0",
     "qrcode": "^1.5.4"
-  },
-  "keywords": [
-    "whatsapp",
-    "baileys",
-    "api",
-    "express",
-    "railway"
-  ],
-  "license": "MIT"
+  }
 }
