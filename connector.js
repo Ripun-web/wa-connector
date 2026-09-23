@@ -1,32 +1,28 @@
 'use strict';
 
 /* =========================================================================
-   WhatsApp Connector v4.0.0 — full-featured, Ubuntu-ready
-   Five connection methods:
-     1. GET  /qr                       -> raw QR string (fastest)
-     2. GET  /qr-image                 -> base64 PNG
-     3. GET  /qr-terminal              -> ASCII QR (for terminal users)
-     4. POST /pair   {phone}           -> 8-char pairing code
-     5. POST /restore                  -> reuse saved auth (auto-resume)
-   Plus:
-     POST /reset          -> wipe auth, force fresh session
-     POST /disconnect     -> logout + wipe
-     POST /connect        -> begin QR flow
-     POST /send-message   -> text
-     POST /send-media     -> image/video/audio/document/location/contact
-     POST /backup         -> tar.gz auth_info and download URL
-     POST /restore-backup -> upload tar.gz to restore session
+   WhatsApp Connector — full version for the PHP API Panel
+   Runtime: Node.js 18+  |  Library: @whiskeysockets/baileys
+   HTTP contract expected by index.php:
+     GET  /                -> {"service":"wa-connector","version":"3.0.0","status":"..."}
+     GET  /status          -> status, phone, name, connected_at, pairing_*, last_error
+     GET  /qr              -> raw QR string (panel renders with qrcode.js) OR base64
+     GET  /qr-image        -> base64 data URL (backup for clients that want it pre-rendered)
+     POST /connect         -> start socket in QR mode
+     POST /pair            -> body {phone:"91..."} -> 8-char pairing code
+     POST /disconnect      -> logout + wipe auth
+     POST /reset | GET /reset -> wipe auth, force disconnect, reset state
+     POST /send-message    -> text
+     POST /send-media      -> image / video / audio / document / location / contact
+   All responses: {"success":true,...} or {"success":false,"error":{"code","message"}}
    ========================================================================= */
 
-const express        = require('express');
-const fs             = require('fs');
-const path           = require('path');
-const os             = require('os');
-const pino           = require('pino');
-const crypto         = require('crypto');
-const QRCode         = require('qrcode');
-const qrcodeTerminal = require('qrcode-terminal');
-const { exec }       = require('child_process');
+const express = require('express');
+const fs      = require('fs');
+const path    = require('path');
+const pino    = require('pino');
+const crypto  = require('crypto');
+const QRCode  = require('qrcode');
 
 const {
   default: makeWASocket,
@@ -34,28 +30,19 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
-  makeCacheableSignalKeyStore,
 } = require('@whiskeysockets/baileys');
 
 /* ------------------------------ config ---------------------------------- */
-const PORT          = parseInt(process.env.PORT || '3000', 10);
-const HOST          = process.env.HOST || '127.0.0.1';
-const AUTH_DIR      = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
-const BACKUP_DIR    = process.env.BACKUP_DIR || path.join(__dirname, 'backups');
-const LOG_LEVEL     = process.env.LOG_LEVEL || 'info';
-const API_TOKEN     = process.env.API_TOKEN || '';
-const PANEL_HOOK    = process.env.PANEL_WEBHOOK_URL || '';
-const HOOK_SECRET   = process.env.PANEL_WEBHOOK_SECRET || '';
-const QR_AS_IMAGE   = process.env.QR_AS_IMAGE === '1';
-const TERMINAL_QR   = process.env.TERMINAL_QR !== '0';   // default: show in terminal
+const PORT        = parseInt(process.env.PORT || '3000', 10);
+const HOST        = process.env.HOST || '0.0.0.0';
+const AUTH_DIR    = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
+const LOG_LEVEL   = process.env.LOG_LEVEL || 'info';
+const API_TOKEN   = process.env.API_TOKEN || '';
+const PANEL_HOOK  = process.env.PANEL_WEBHOOK_URL || '';
+const HOOK_SECRET = process.env.PANEL_WEBHOOK_SECRET || '';
+const QR_AS_IMAGE = process.env.QR_AS_IMAGE === '1'; // set to 1 to serve base64 on /qr
 
-const logger = pino({
-  level: LOG_LEVEL,
-  transport: process.env.NODE_ENV === 'production'
-    ? undefined
-    : { target: 'pino-pretty', options: { colorize: true } },
-});
-
+const logger = pino({ level: LOG_LEVEL });
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 /* ------------------------------- state ---------------------------------- */
@@ -64,17 +51,14 @@ const state = {
   phone: '',
   name: '',
   connected_at: 0,
-  qr: '',
-  qr_image: '',
-  qr_terminal: '',
+  qr: '',                        // RAW string by default; base64 if QR_AS_IMAGE=1
+  qr_image: '',                  // always base64 (backup)
   qr_expires_at: 0,
   pairing_code: '',
   pairing_phone: '',
   last_error: '',
   last_change: Date.now(),
-  mode: '',
-  reconnect_count: 0,
-  uptime_start: Date.now(),
+  mode: '',                      // 'qr' | 'pair' | ''
 };
 
 let sock = null;
@@ -88,11 +72,9 @@ function setStatus(s, extra = {}) {
   state.status = s;
   Object.assign(state, extra);
   state.last_change = Date.now();
-
   if (s !== 'qr') {
     state.qr = '';
     state.qr_image = '';
-    state.qr_terminal = '';
     state.qr_expires_at = 0;
   }
   if (s !== 'pairing') {
@@ -118,7 +100,7 @@ async function forwardToPanel(event, data) {
     }
     await fetch(PANEL_HOOK, { method: 'POST', headers, body });
   } catch (e) {
-    logger.warn({ e: e.message }, 'panel webhook failed');
+    logger.warn({ e: e.message }, 'panel webhook forward failed');
   }
 }
 
@@ -133,11 +115,6 @@ function wipeAuthDir() {
   }
 }
 
-function ensureDirs() {
-  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-  if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
-}
-
 async function teardownSocket() {
   if (sock) {
     try { sock.ev.removeAllListeners(); } catch (_) {}
@@ -146,18 +123,24 @@ async function teardownSocket() {
     sock = null;
   }
   starting = false;
+  // Give Baileys a moment to release the socket
   await new Promise(r => setTimeout(r, 300));
 }
 
+/* Wait until the underlying WebSocket is truly open */
 function waitSocketOpen(s, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const tick = () => {
       try {
         const ws = s?.ws;
-        if (ws && (ws.isOpen === true || ws.readyState === 1)) return resolve();
+        if (ws && (ws.isOpen === true || ws.readyState === 1)) {
+          return resolve();
+        }
       } catch (_) {}
-      if (Date.now() - start > timeoutMs) return reject(new Error('Socket open timeout'));
+      if (Date.now() - start > timeoutMs) {
+        return reject(new Error('Socket open timeout'));
+      }
       setTimeout(tick, 200);
     };
     tick();
@@ -167,13 +150,14 @@ function waitSocketOpen(s, timeoutMs = 30000) {
 /* --------------------------- socket lifecycle --------------------------- */
 async function startSocket(mode = 'qr', pairingPhone = '') {
   await teardownSocket();
-  ensureDirs();
 
   starting = true;
   stopRequested = false;
   state.mode = mode;
 
   try {
+    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
     const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -181,16 +165,10 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
 
     const created = makeWASocket({
       version,
-      auth: {
-        creds: authState.creds,
-        keys: makeCacheableSignalKeyStore(
-          authState.keys,
-          pino({ level: 'silent' }),
-        ),
-      },
+      auth: authState,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: Browsers.macOS('Chrome'),
+      browser: Browsers.macOS('Chrome'),           // widely accepted by WhatsApp
       syncFullHistory: false,
       markOnlineOnConnect: true,
       connectTimeoutMs: 60000,
@@ -203,29 +181,21 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
     });
 
     sock = created;
+
     created.ev.on('creds.update', saveCreds);
 
     created.ev.on('connection.update', async (u) => {
       const { connection, lastDisconnect, qr } = u || {};
 
-      /* --- QR --- */
+      /* --- QR event --- */
       if (qr && state.mode === 'qr') {
         try {
-          state.qr = qr;
-
+          state.qr = qr;                         // raw string
           state.qr_image = await QRCode.toDataURL(qr, {
-            margin: 1, width: 512, errorCorrectionLevel: 'M',
+            margin: 1,
+            width: 512,
+            errorCorrectionLevel: 'M',
           });
-
-          if (TERMINAL_QR) {
-            qrcodeTerminal.generate(qr, { small: true }, (ascii) => {
-              state.qr_terminal = ascii;
-              console.log('\n=== SCAN THIS QR WITH WHATSAPP ===\n');
-              console.log(ascii);
-              console.log('==================================\n');
-            });
-          }
-
           state.qr_expires_at = nowSec() + 45;
           setStatus('qr');
         } catch (e) {
@@ -237,7 +207,6 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
       if (connection === 'open') {
         const user = created.user || {};
         const phone = (user.id || '').split(':')[0].split('@')[0];
-        state.reconnect_count = 0;
         setStatus('connected', {
           phone,
           name: user.name || user.verifiedName || '',
@@ -246,7 +215,7 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
           mode: '',
         });
         forwardToPanel('whatsapp.connected', { phone, name: user.name || '' });
-        logger.info({ phone }, '✓ connected');
+        logger.info({ phone }, 'connected');
       }
 
       /* --- Closed --- */
@@ -266,14 +235,11 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
           });
           forwardToPanel('whatsapp.disconnected', { reason: 'logged_out' });
         } else if (!stopRequested) {
-          state.reconnect_count++;
-          const delay = Math.min(30000, 3000 * state.reconnect_count);
           setStatus('connecting', { last_error: reason });
           clearTimeout(reconnectTimer);
           reconnectTimer = setTimeout(() => {
-            logger.info({ delay, attempt: state.reconnect_count }, 'reconnecting');
             startSocket(state.mode || 'qr').catch(() => {});
-          }, delay);
+          }, 3000);
         } else {
           setStatus('disconnected', { last_error: reason, mode: '' });
           forwardToPanel('whatsapp.disconnected', { reason });
@@ -299,7 +265,7 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
       }
     });
 
-    /* --- Pairing mode --- */
+    /* --- Pairing mode: wait for socket ready, then request code --- */
     if (mode === 'pair' && pairingPhone) {
       try {
         await waitSocketOpen(created, 30000);
@@ -308,6 +274,7 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
       }
 
       await new Promise(r => setTimeout(r, 800));
+
       if (!sock || sock !== created) throw new Error('Socket was replaced');
 
       let lastErr = null;
@@ -318,14 +285,7 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
           state.pairing_phone = pairingPhone;
           setStatus('pairing');
           lastErr = null;
-
-          logger.info({ code, attempt }, '✓ pairing code acquired');
-          console.log('\n=== PAIRING CODE ===\n');
-          console.log('  ' + code);
-          console.log('\nEnter this on your phone:');
-          console.log('  WhatsApp → Settings → Linked Devices → Link with phone number\n');
-
-          forwardToPanel('whatsapp.pairing', { code, phone: pairingPhone });
+          logger.info({ code, attempt }, 'pairing code acquired');
           break;
         } catch (e) {
           lastErr = e;
@@ -367,22 +327,13 @@ async function resetSocket() {
 
   await teardownSocket();
   wipeAuthDir();
-  state.reconnect_count = 0;
 
   setStatus('disconnected', {
     phone: '', name: '', connected_at: 0,
     last_error: '', mode: '',
   });
-}
 
-async function restoreSession() {
-  const files = fs.existsSync(AUTH_DIR) ? fs.readdirSync(AUTH_DIR) : [];
-  const hasCreds = files.some(f => f.startsWith('creds'));
-  if (!hasCreds) {
-    throw new Error('No saved credentials found');
-  }
-  logger.info('restoring session from disk');
-  return startSocket('qr');
+  // Do NOT auto-restart; the panel calls /connect next.
 }
 
 /* ------------------------------ sending --------------------------------- */
@@ -396,9 +347,9 @@ async function sendOne(payload) {
   const phone = String(payload.phone || '').replace(/\D/g, '');
   if (!phone) {
     const e = new Error('Invalid phone number');
-    e.code = 'INVALID_PHONE'; throw e;
+    e.code = 'INVALID_PHONE';
+    throw e;
   }
-
   const jid = jidFromPhone(phone);
   const type = String(payload.type || 'text').toLowerCase();
   let content;
@@ -406,7 +357,9 @@ async function sendOne(payload) {
   switch (type) {
     case 'text': {
       const text = String(payload.message || '').trim();
-      if (!text) { const e = new Error('Empty message'); e.code = 'INVALID_MESSAGE'; throw e; }
+      if (!text) {
+        const e = new Error('Empty message'); e.code = 'INVALID_MESSAGE'; throw e;
+      }
       content = { text };
       break;
     }
@@ -440,11 +393,15 @@ async function sendOne(payload) {
       const cname = String(payload.name || '').trim();
       const cphone = String(payload.contact_phone || '').replace(/\D/g, '');
       if (!cname || !cphone) {
-        const e = new Error('Contact name and phone required'); e.code = 'INVALID_MESSAGE'; throw e;
+        const e = new Error('Contact name and phone required');
+        e.code = 'INVALID_MESSAGE'; throw e;
       }
       const vcard = [
-        'BEGIN:VCARD','VERSION:3.0',`FN:${cname}`,
-        `TEL;type=CELL;type=VOICE;waid=${cphone}:+${cphone}`,'END:VCARD',
+        'BEGIN:VCARD',
+        'VERSION:3.0',
+        `FN:${cname}`,
+        `TEL;type=CELL;type=VOICE;waid=${cphone}:+${cphone}`,
+        'END:VCARD',
       ].join('\n');
       content = { contacts: { displayName: cname, contacts: [{ vcard }] } };
       break;
@@ -462,9 +419,8 @@ async function sendOne(payload) {
 /* -------------------------------- server -------------------------------- */
 const app = express();
 app.use(express.json({ limit: '2mb' }));
-app.use(express.raw({ type: 'application/gzip', limit: '20mb' }));
 
-/* Optional token */
+/* Optional shared-secret protection */
 app.use((req, res, next) => {
   if (!API_TOKEN) return next();
   const hdr = req.headers['authorization'] || '';
@@ -485,16 +441,8 @@ const fail = (res, m, c = 'ERROR', h = 400) =>
 /* ---------- root ---------- */
 app.get('/', (_r, r) => r.json({
   service: 'wa-connector',
-  version: '4.0.0',
+  version: '3.0.0',
   status: state.status,
-  uptime: Math.floor((Date.now() - state.uptime_start) / 1000),
-  methods: [
-    'GET /status', 'GET /qr', 'GET /qr-image', 'GET /qr-terminal',
-    'POST /connect', 'POST /pair {phone}', 'POST /restore',
-    'POST /disconnect', 'POST /reset',
-    'POST /send-message', 'POST /send-media',
-    'POST /backup', 'POST /restore-backup',
-  ],
 }));
 
 /* ---------- status ---------- */
@@ -506,11 +454,9 @@ app.get('/status', (_r, r) => ok(r, {
   pairing_code: state.pairing_code,
   pairing_phone: state.pairing_phone,
   last_error: state.last_error,
-  reconnect_count: state.reconnect_count,
-  uptime: Math.floor((Date.now() - state.uptime_start) / 1000),
 }));
 
-/* ---------- QR (raw string) ---------- */
+/* ---------- QR ---------- */
 app.get('/qr', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   if (state.qr) {
@@ -527,7 +473,7 @@ app.get('/qr', async (_r, r) => {
   });
 });
 
-/* ---------- QR (base64 image) ---------- */
+/* ---------- QR as base64 image (always) ---------- */
 app.get('/qr-image', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   if (state.qr_image) {
@@ -544,20 +490,6 @@ app.get('/qr-image', async (_r, r) => {
   });
 });
 
-/* ---------- QR (terminal ASCII) ---------- */
-app.get('/qr-terminal', (_r, r) => {
-  if (state.status === 'connected') return ok(r, { status: 'connected' });
-  if (state.qr_terminal) {
-    return ok(r, {
-      status: 'qr',
-      ascii: state.qr_terminal,
-      expires_at: state.qr_expires_at,
-    });
-  }
-  if (!sock && !starting) startSocket('qr').catch(() => {});
-  ok(r, { status: 'connecting', ascii: '' });
-});
-
 /* ---------- connect ---------- */
 app.post('/connect', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
@@ -565,7 +497,7 @@ app.post('/connect', async (_r, r) => {
   ok(r, { status: 'connecting' });
 });
 
-/* ---------- pairing code ---------- */
+/* ---------- pairing ---------- */
 app.post('/pair', async (req, res) => {
   const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
   if (phone.length < 8 || phone.length > 15) {
@@ -583,16 +515,6 @@ app.post('/pair', async (req, res) => {
     ok(res, { code: state.pairing_code, status: 'pairing', phone });
   } catch (e) {
     fail(res, e.message || 'Pair failed', 'PAIR_FAILED', 500);
-  }
-});
-
-/* ---------- restore saved session ---------- */
-app.post('/restore', async (_r, r) => {
-  try {
-    await restoreSession();
-    ok(r, { status: state.status });
-  } catch (e) {
-    fail(r, e.message, 'RESTORE_FAILED', 500);
   }
 });
 
@@ -627,69 +549,15 @@ async function handleSend(req, res) {
     const code = e.code || 'SEND_FAILED';
     const http =
       code === 'WHATSAPP_NOT_CONNECTED' ? 409 :
-      (code === 'INVALID_PHONE' || code === 'INVALID_MESSAGE') ? 422 : 500;
+      (code === 'INVALID_PHONE' || code === 'INVALID_MESSAGE') ? 422 :
+      500;
     fail(res, e.message, code, http);
   }
 }
 app.post('/send-message', handleSend);
 app.post('/send-media',   handleSend);
 
-/* ---------- backup auth (tar.gz) ---------- */
-app.post('/backup', async (_r, r) => {
-  try {
-    if (!fs.existsSync(AUTH_DIR)) return fail(r, 'No auth folder to backup', 'NO_AUTH', 400);
-    ensureDirs();
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const out = path.join(BACKUP_DIR, `auth-backup-${stamp}.tar.gz`);
-
-    await new Promise((resolve, reject) => {
-      exec(`tar -czf ${JSON.stringify(out)} -C ${JSON.stringify(path.dirname(AUTH_DIR))} ${JSON.stringify(path.basename(AUTH_DIR))}`,
-        (err) => err ? reject(err) : resolve());
-    });
-
-    const stat = fs.statSync(out);
-    ok(r, {
-      filename: path.basename(out),
-      size: stat.size,
-      download_url: `/backup/${path.basename(out)}`,
-    });
-  } catch (e) {
-    fail(r, e.message, 'BACKUP_FAILED', 500);
-  }
-});
-
-app.get('/backup/:file', (req, res) => {
-  const f = path.join(BACKUP_DIR, path.basename(req.params.file));
-  if (!fs.existsSync(f)) return res.status(404).end();
-  res.download(f);
-});
-
-/* ---------- restore backup (upload tar.gz) ---------- */
-app.post('/restore-backup', async (req, res) => {
-  try {
-    if (!Buffer.isBuffer(req.body) || req.body.length < 100) {
-      return fail(res, 'Send raw tar.gz as application/gzip', 'INVALID_BODY', 422);
-    }
-    const tmp = path.join(BACKUP_DIR, `upload-${Date.now()}.tar.gz`);
-    fs.writeFileSync(tmp, req.body);
-
-    await teardownSocket();
-    wipeAuthDir();
-
-    await new Promise((resolve, reject) => {
-      exec(`tar -xzf ${JSON.stringify(tmp)} -C ${JSON.stringify(path.dirname(AUTH_DIR))}`,
-        (err) => err ? reject(err) : resolve());
-    });
-    fs.unlinkSync(tmp);
-
-    await startSocket('qr');
-    ok(res, { restored: true, status: state.status });
-  } catch (e) {
-    fail(res, e.message, 'RESTORE_FAILED', 500);
-  }
-});
-
-/* ---------- health ---------- */
+/* ---------- healthcheck for Railway ---------- */
 app.get('/health', (_r, r) => r.json({ ok: true, status: state.status }));
 
 /* ------------------------------ watchdog -------------------------------- */
@@ -698,13 +566,19 @@ function startWatchdog() {
   watchdog = setInterval(() => {
     const stuckFor = Date.now() - state.last_change;
 
+    /* Stuck in "connecting" for too long → restart */
     if (state.status === 'connecting' && stuckFor > 40000) {
       logger.warn({ stuckFor }, 'stuck in connecting — restarting');
       startSocket(state.mode || 'qr').catch(() => {});
       return;
     }
 
-    if (state.status === 'qr' && state.qr_expires_at && nowSec() > state.qr_expires_at + 5) {
+    /* QR expired → regenerate */
+    if (
+      state.status === 'qr' &&
+      state.qr_expires_at &&
+      nowSec() > state.qr_expires_at + 5
+    ) {
       logger.info('QR expired — regenerating');
       startSocket('qr').catch(() => {});
     }
@@ -713,9 +587,9 @@ function startWatchdog() {
 
 /* ------------------------------ bootstrap ------------------------------- */
 (async () => {
-  ensureDirs();
   startWatchdog();
 
+  /* Auto-resume only if we have a real creds file */
   if (fs.existsSync(AUTH_DIR)) {
     try {
       const files = fs.readdirSync(AUTH_DIR);
@@ -727,17 +601,10 @@ function startWatchdog() {
   }
 
   app.listen(PORT, HOST, () => {
-    logger.info(`wa-connector v4.0.0 listening on http://${HOST}:${PORT}`);
+    logger.info(`wa-connector v3.0.0 listening on http://${HOST}:${PORT}`);
     logger.info(`auth dir: ${AUTH_DIR}`);
-    logger.info(`backup dir: ${BACKUP_DIR}`);
     if (API_TOKEN) logger.info('API_TOKEN protection enabled');
     if (PANEL_HOOK) logger.info(`forwarding events to ${PANEL_HOOK}`);
-    console.log('\nConnection methods:');
-    console.log('  QR raw          GET  /qr');
-    console.log('  QR base64       GET  /qr-image');
-    console.log('  QR terminal     GET  /qr-terminal');
-    console.log('  Pairing code    POST /pair {phone}');
-    console.log('  Restore saved   POST /restore');
   });
 })();
 
@@ -752,5 +619,9 @@ process.on('SIGTERM', async () => {
   try { await disconnectSocket(); } catch (_) {}
   process.exit(0);
 });
-process.on('unhandledRejection', (e) => logger.error({ err: String(e) }, 'unhandledRejection'));
-process.on('uncaughtException',  (e) => logger.error({ err: String(e) }, 'uncaughtException'));
+process.on('unhandledRejection', (e) => {
+  logger.error({ err: String(e) }, 'unhandledRejection');
+});
+process.on('uncaughtException', (e) => {
+  logger.error({ err: String(e) }, 'uncaughtException');
+});
