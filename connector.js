@@ -1,4 +1,6 @@
 'use strict';
+/* WhatsApp Connector v2.1.0 — fixed pairing + reset + proper state machine */
+
 const express = require('express');
 const QRCode  = require('qrcode');
 const fs      = require('fs');
@@ -11,41 +13,53 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  Browsers,
 } = require('@whiskeysockets/baileys');
 
-const PORT       = parseInt(process.env.PORT || '3000', 10);
-const HOST       = process.env.HOST || '0.0.0.0';
-const AUTH_DIR   = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
-const API_TOKEN  = process.env.API_TOKEN || '';
-const PANEL_HOOK = process.env.PANEL_WEBHOOK_URL || '';
-const HOOK_SECRET= process.env.PANEL_WEBHOOK_SECRET || '';
+const PORT        = parseInt(process.env.PORT || '3000', 10);
+const HOST        = process.env.HOST || '0.0.0.0';
+const AUTH_DIR    = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
+const API_TOKEN   = process.env.API_TOKEN || '';
+const PANEL_HOOK  = process.env.PANEL_WEBHOOK_URL || '';
+const HOOK_SECRET = process.env.PANEL_WEBHOOK_SECRET || '';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 const state = {
-  status: 'disconnected',
+  status: 'disconnected',      // disconnected | starting | qr | pairing | connecting | connected | error
   phone: '', name: '', connected_at: 0,
   qr: '', qr_expires_at: 0,
   pairing_code: '', pairing_phone: '',
   last_error: '',
+  started_at: 0,
 };
 
 let sock = null;
 let starting = false;
 let stopRequested = false;
 let reconnectTimer = null;
-let currentMode = 'qr';
-
-function log(...a) { console.log('[connector]', ...a); }
+let currentMode = 'qr';         // 'qr' | 'pair'
+let sockReadyResolve = null;
+let sockReadyPromise = null;
 
 function setStatus(s, extra = {}) {
   state.status = s;
   Object.assign(state, extra);
   if (s !== 'qr') { state.qr = ''; state.qr_expires_at = 0; }
   if (s !== 'pairing') { state.pairing_code = ''; state.pairing_phone = ''; }
-  log('STATUS →', s, state.phone || '', state.last_error || '');
+  logger.info({ status: s, phone: state.phone, error: state.last_error || undefined }, 'state → ' + s);
+}
+
+function resetSockReady() {
+  sockReadyPromise = new Promise((resolve) => { sockReadyResolve = resolve; });
+}
+
+async function waitForSock(timeoutMs = 15000) {
+  if (sock) return sock;
+  if (!sockReadyPromise) return null;
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+  const winner = await Promise.race([sockReadyPromise, timeout]);
+  return winner || sock || null;
 }
 
 function jidFromPhone(p) {
@@ -61,70 +75,61 @@ async function forwardToPanel(event, data) {
     if (HOOK_SECRET) headers['X-Webhook-Signature'] =
       crypto.createHmac('sha256', HOOK_SECRET).update(body).digest('hex');
     await fetch(PANEL_HOOK, { method: 'POST', headers, body });
-  } catch (e) { log('panel hook fail:', e.message); }
-}
-
-async function killSocket() {
-  if (!sock) return;
-  try { sock.ev.removeAllListeners(); } catch (_) {}
-  try { sock.end(undefined); } catch (_) {}
-  sock = null;
-  await new Promise(r => setTimeout(r, 400));
+  } catch (e) { logger.warn({ e: e.message }, 'panel webhook failed'); }
 }
 
 async function startSocket(mode = 'qr') {
-  if (sock) {
-    log('startSocket: sock already exists, killing first');
-    await killSocket();
-  }
   if (starting) {
-    log('startSocket: already starting, waiting...');
-    for (let i = 0; i < 40; i++) {
-      await new Promise(r => setTimeout(r, 200));
-      if (!starting) break;
-    }
+    // Already starting — just wait for the existing socket
+    return waitForSock();
   }
+  if (sock) return sock;
+
   starting = true;
   stopRequested = false;
   currentMode = mode;
+  resetSockReady();
 
   try {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
     const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
-    log('Baileys version:', version.join('.'));
-    setStatus('connecting');
+
+    setStatus('starting', { started_at: nowSec(), last_error: '' });
 
     sock = makeWASocket({
       version,
       auth: authState,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: Browsers.macOS('Desktop'),
+      browser: ['WA Panel', 'Chrome', '1.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: true,
-      generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 25000,
+      keepAliveIntervalMs: 30000,
     });
+
+    // Notify any waiters that sock exists
+    if (sockReadyResolve) { sockReadyResolve(sock); sockReadyResolve = null; }
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (u) => {
-      const { connection, lastDisconnect, qr, isNewLogin } = u || {};
-      if (qr) log('QR received from Baileys (len=' + qr.length + ')');
-      if (connection) log('connection.update →', connection);
+      const { connection, lastDisconnect, qr } = u || {};
 
-      if (qr && currentMode === 'qr') {
-        try {
-          state.qr = await QRCode.toDataURL(qr, { margin: 1, width: 512 });
-          state.qr_expires_at = nowSec() + 60;
-          setStatus('qr');
-        } catch (e) { log('QR encode fail:', e.message); }
+      if (qr) {
+        if (currentMode === 'qr') {
+          try {
+            state.qr = await QRCode.toDataURL(qr, { margin: 1, width: 512 });
+            state.qr_expires_at = nowSec() + 60;
+            setStatus('qr');
+          } catch (e) {
+            logger.error({ e: e.message }, 'qr encode failed');
+            setStatus('error', { last_error: 'QR encode failed: ' + e.message });
+          }
+        }
       }
-
-      if (isNewLogin) log('NEW LOGIN DETECTED');
 
       if (connection === 'open') {
         const user = sock?.user || {};
@@ -141,12 +146,7 @@ async function startSocket(mode = 'qr') {
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || 'connection closed';
-        log('socket closed. code=', code, 'reason=', reason);
-
-        const wasSock = sock;
         sock = null;
-        try { wasSock?.ev.removeAllListeners(); } catch (_) {}
-
         if (code === DisconnectReason.loggedOut) {
           try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
           setStatus('disconnected', { phone: '', name: '', connected_at: 0, last_error: 'logged out' });
@@ -154,7 +154,7 @@ async function startSocket(mode = 'qr') {
         } else if (!stopRequested) {
           setStatus('connecting', { last_error: reason });
           clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => { startSocket(currentMode).catch(e => log('restart fail:', e.message)); }, 3000);
+          reconnectTimer = setTimeout(() => { startSocket(currentMode).catch(() => {}); }, 3000);
         } else {
           setStatus('disconnected', { last_error: reason });
           forwardToPanel('whatsapp.disconnected', { reason });
@@ -173,19 +173,28 @@ async function startSocket(mode = 'qr') {
       }
     });
 
+    return sock;
   } catch (e) {
-    log('startSocket error:', e.message);
+    logger.error({ e: e.message }, 'startSocket failed');
     setStatus('error', { last_error: e.message });
+    if (sockReadyResolve) { sockReadyResolve(null); sockReadyResolve = null; }
+    return null;
   } finally {
     starting = false;
   }
 }
 
-async function disconnectSocket() {
+async function disconnectSocket(wipe = true) {
   stopRequested = true;
   clearTimeout(reconnectTimer); reconnectTimer = null;
-  await killSocket();
-  try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+  if (sock) {
+    try { await sock.logout(); }
+    catch (_) { try { sock.end(undefined); } catch (_) {} }
+    sock = null;
+  }
+  if (wipe) {
+    try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+  }
   setStatus('disconnected', { phone: '', name: '', connected_at: 0, last_error: '' });
 }
 
@@ -194,7 +203,7 @@ async function sendOne(payload) {
     const e = new Error('WhatsApp is not connected'); e.code = 'WHATSAPP_NOT_CONNECTED'; throw e;
   }
   const phone = String(payload.phone || '').replace(/\D/g, '');
-  if (!phone) { const e = new Error('Invalid phone'); e.code = 'INVALID_PHONE'; throw e; }
+  if (!phone) { const e = new Error('Invalid phone number'); e.code = 'INVALID_PHONE'; throw e; }
   const jid = jidFromPhone(phone);
   const type = String(payload.type || 'text').toLowerCase();
   let content;
@@ -209,8 +218,11 @@ async function sendOne(payload) {
     case 'audio':    content = { audio:    { url: payload.url }, mimetype: 'audio/mp4', ptt: false };    break;
     case 'document': content = { document: { url: payload.url }, fileName: payload.filename || 'document.pdf',
                                  caption: payload.caption || undefined, mimetype: 'application/octet-stream' }; break;
-    case 'location': content = { location: { degreesLatitude: Number(payload.latitude),
-                              degreesLongitude: Number(payload.longitude), name: payload.name || undefined } }; break;
+    case 'location':
+      content = { location: { degreesLatitude: Number(payload.latitude),
+                              degreesLongitude: Number(payload.longitude),
+                              name: payload.name || undefined } };
+      break;
     case 'contact': {
       const cname = String(payload.name || '').trim();
       const cphone = String(payload.contact_phone || '').replace(/\D/g, '');
@@ -242,93 +254,116 @@ const ok   = (res, x = {}) => res.json({ success: true, ...x });
 const fail = (res, m, c = 'ERROR', h = 400) =>
   res.status(h).json({ success: false, error: { code: c, message: m } });
 
-app.get('/', (_r, r) => r.json({ service: 'wa-connector', version: '1.2.0', status: state.status }));
+app.get('/', (_r, r) => r.json({ service: 'wa-connector', version: '2.1.0', status: state.status }));
 
 app.get('/status', (_r, r) => ok(r, {
   status: state.status,
-  phone: state.phone, name: state.name,
+  phone: state.phone,
+  name: state.name,
   connected_at: state.connected_at,
   pairing_code: state.pairing_code,
   pairing_phone: state.pairing_phone,
   last_error: state.last_error,
+  has_qr: !!state.qr,
+  has_sock: !!sock,
+  auth_exists: fs.existsSync(AUTH_DIR),
 }));
 
 app.get('/qr', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   if (state.qr) return ok(r, { status: 'qr', qr: state.qr, expires_at: state.qr_expires_at });
-  if (!sock && !starting) startSocket('qr').catch(e => log('start fail:', e.message));
-  ok(r, { status: state.status === 'disconnected' ? 'connecting' : state.status, qr: '' });
+  // No QR yet — kick off socket if idle
+  if (!sock && !starting && state.status === 'disconnected') {
+    currentMode = 'qr';
+    startSocket('qr').catch(() => {});
+  }
+  ok(r, { status: state.status, qr: '' });
 });
 
 app.post('/connect', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
-  if (!sock && !starting) startSocket('qr').catch(e => log('start fail:', e.message));
-  ok(r, { status: state.status === 'qr' ? 'qr' : 'connecting' });
+  currentMode = 'qr';
+  // If stuck in connecting for too long, reset
+  if ((state.status === 'connecting' || state.status === 'starting') && state.started_at && (nowSec() - state.started_at) > 90) {
+    logger.warn('stuck connecting — resetting');
+    try { await disconnectSocket(true); } catch (_) {}
+  }
+  if (!sock) startSocket('qr').catch(() => {});
+  ok(r, { status: state.status === 'qr' ? 'qr' : 'starting' });
 });
 
 app.post('/pair', async (req, res) => {
   const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
-  if (phone.length < 8 || phone.length > 15)
+  if (phone.length < 8 || phone.length > 15) {
     return fail(res, 'Enter phone with country code (e.g. 919876543210)', 'INVALID_PHONE', 422);
-  if (state.status === 'connected')
+  }
+  if (state.status === 'connected') {
     return fail(res, 'Already connected. Disconnect first.', 'ALREADY_CONNECTED', 409);
+  }
 
   try {
-    log('PAIR request for', phone);
-    await killSocket();
-    starting = false;
-    setStatus('connecting');
-
-    await startSocket('pair');
-
-    // Wait for sock to be assigned
-    for (let i = 0; i < 50 && !sock; i++) {
-      await new Promise(r => setTimeout(r, 200));
+    // Start a FRESH socket in pair mode
+    if (sock) {
+      stopRequested = true;
+      try { sock.end(undefined); } catch (_) {}
+      sock = null;
+      await new Promise(r => setTimeout(r, 400));
     }
-    if (!sock) {
-      return fail(res, 'Socket failed to initialize. Try /reset then retry.', 'SOCKET_INIT_FAILED', 500);
+    try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+    currentMode = 'pair';
+    stopRequested = false;
+
+    // Kick off socket creation
+    const startPromise = startSocket('pair');
+
+    // Wait for sock to actually be created (not null)
+    const readySock = await waitForSock(15000);
+    if (!readySock) {
+      await startPromise.catch(() => {});
+      const s2 = await waitForSock(8000);
+      if (!s2) return fail(res, 'Socket failed to start. Check Railway logs.', 'SOCKET_NOT_READY', 500);
+      return await requestCode(s2, phone, res);
     }
+    return await requestCode(readySock, phone, res);
+  } catch (e) {
+    logger.error({ e: e.message }, 'pair failed');
+    fail(res, e.message || 'Could not generate pairing code', 'PAIR_FAILED', 500);
+  }
+});
 
-    // Small settle
-    await new Promise(r => setTimeout(r, 1200));
-
-    if (typeof sock.requestPairingCode !== 'function') {
-      return fail(res, 'Pairing not supported by this Baileys version. Use QR instead.', 'PAIR_UNSUPPORTED', 500);
+async function requestCode(s, phone, res) {
+  try {
+    // Baileys requires the socket's WS to be at least opening.
+    // Give it a moment if it just got created.
+    await new Promise(r => setTimeout(r, 1500));
+    if (!s || !s.requestPairingCode) {
+      return fail(res, 'Socket missing requestPairingCode — Baileys version mismatch.', 'BAD_SOCKET', 500);
     }
-
-    log('Requesting pairing code...');
-    const code = await sock.requestPairingCode(phone);
-    log('Pairing code:', code);
+    const code = await s.requestPairingCode(phone);
     state.pairing_code = code;
     state.pairing_phone = phone;
     setStatus('pairing');
     ok(res, { code, status: 'pairing', phone });
   } catch (e) {
-    log('PAIR error:', e.message);
-    fail(res, e.message || 'Could not generate pairing code', 'PAIR_FAILED', 500);
+    logger.error({ e: e.message }, 'requestPairingCode failed');
+    fail(res, e.message || 'Pairing code request failed', 'PAIR_FAILED', 500);
   }
-});
+}
 
 app.post('/disconnect', async (_r, r) => {
-  try { await disconnectSocket(); ok(r, { status: 'disconnected' }); }
-  catch (e) { fail(res, e.message, 'DISCONNECT_FAILED', 500); }
+  try { await disconnectSocket(true); ok(r, { status: 'disconnected' }); }
+  catch (e) { fail(r, e.message, 'DISCONNECT_FAILED', 500); }
 });
 
 app.post('/reset', async (_r, r) => {
   try {
     stopRequested = true;
     clearTimeout(reconnectTimer); reconnectTimer = null;
-    await killSocket();
+    if (sock) { try { sock.end(undefined); } catch (_) {} sock = null; }
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
-    starting = false;
-    state.status = 'disconnected';
-    state.qr = ''; state.qr_expires_at = 0;
-    state.pairing_code = ''; state.pairing_phone = '';
-    state.phone = ''; state.name = ''; state.connected_at = 0;
-    state.last_error = '';
-    log('RESET complete');
-    ok(r, { status: 'disconnected' });
-  } catch (e) { fail(res, e.message, 'RESET_FAILED', 500); }
+    setStatus('disconnected', { phone: '', name: '', connected_at: 0, last_error: '' });
+    ok(r, { status: 'disconnected', message: 'Auth cleared. Ready for fresh scan.' });
+  } catch (e) { fail(r, e.message, 'RESET_FAILED', 500); }
 });
 
 async function handleSend(req, res) {
@@ -346,12 +381,15 @@ app.post('/send-message', handleSend);
 app.post('/send-media',   handleSend);
 
 (async () => {
+  // Always start fresh if no auth exists; otherwise resume
   if (fs.existsSync(AUTH_DIR) && fs.readdirSync(AUTH_DIR).length > 0) {
-    log('Existing session found — resuming');
-    startSocket('qr').catch(e => log('resume fail:', e.message));
+    logger.info('existing session found — resuming');
+    startSocket('qr').catch(() => {});
+  } else {
+    logger.info('no session — waiting for /connect or /pair');
   }
-  app.listen(PORT, HOST, () => log(`listening on http://${HOST}:${PORT}`));
+  app.listen(PORT, HOST, () => logger.info(`wa-connector v2.1.0 listening on http://${HOST}:${PORT}`));
 })();
 
-process.on('SIGINT',  async () => { try { await disconnectSocket(); } catch(_){} process.exit(0); });
-process.on('SIGTERM', async () => { try { await disconnectSocket(); } catch(_){} process.exit(0); });
+process.on('SIGINT',  async () => { try { await disconnectSocket(false); } catch(_){} process.exit(0); });
+process.on('SIGTERM', async () => { try { await disconnectSocket(false); } catch(_){} process.exit(0); });
