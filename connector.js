@@ -4,17 +4,17 @@
    WhatsApp Connector — full version for the PHP API Panel
    Runtime: Node.js 18+  |  Library: @whiskeysockets/baileys
    HTTP contract expected by index.php:
-     GET  /                -> {"service":"wa-connector","version":"3.0.0","status":"..."}
-     GET  /status          -> status, phone, name, connected_at, pairing_*, last_error
-     GET  /qr              -> raw QR string (panel renders with qrcode.js) OR base64
-     GET  /qr-image        -> base64 data URL (backup for clients that want it pre-rendered)
+     GET  /                -> redirects to /connect
+     GET  /connect         -> HTML page with QR + pairing UI
+     GET  /status          -> JSON status
+     GET  /qr              -> raw QR string (or base64 if QR_AS_IMAGE=1)
+     GET  /qr-image        -> base64 data URL
      POST /connect         -> start socket in QR mode
-     POST /pair            -> body {phone:"91..."} -> 8-char pairing code
+     POST /pair            -> body {phone:"91..."} -> pairing code
      POST /disconnect      -> logout + wipe auth
-     POST /reset | GET /reset -> wipe auth, force disconnect, reset state
+     POST /reset | GET /reset -> wipe auth, reset state
      POST /send-message    -> text
      POST /send-media      -> image / video / audio / document / location / contact
-   All responses: {"success":true,...} or {"success":false,"error":{"code","message"}}
    ========================================================================= */
 
 const express = require('express');
@@ -40,7 +40,7 @@ const LOG_LEVEL   = process.env.LOG_LEVEL || 'info';
 const API_TOKEN   = process.env.API_TOKEN || '';
 const PANEL_HOOK  = process.env.PANEL_WEBHOOK_URL || '';
 const HOOK_SECRET = process.env.PANEL_WEBHOOK_SECRET || '';
-const QR_AS_IMAGE = process.env.QR_AS_IMAGE === '1'; // set to 1 to serve base64 on /qr
+const QR_AS_IMAGE = process.env.QR_AS_IMAGE === '1';
 
 const logger = pino({ level: LOG_LEVEL });
 const nowSec = () => Math.floor(Date.now() / 1000);
@@ -51,8 +51,8 @@ const state = {
   phone: '',
   name: '',
   connected_at: 0,
-  qr: '',                        // RAW string by default; base64 if QR_AS_IMAGE=1
-  qr_image: '',                  // always base64 (backup)
+  qr: '',                        // RAW string by default
+  qr_image: '',                  // base64 data URL (always populated)
   qr_expires_at: 0,
   pairing_code: '',
   pairing_phone: '',
@@ -123,11 +123,9 @@ async function teardownSocket() {
     sock = null;
   }
   starting = false;
-  // Give Baileys a moment to release the socket
   await new Promise(r => setTimeout(r, 300));
 }
 
-/* Wait until the underlying WebSocket is truly open */
 function waitSocketOpen(s, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -168,7 +166,7 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
       auth: authState,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: Browsers.macOS('Chrome'),           // widely accepted by WhatsApp
+      browser: Browsers.macOS('Chrome'),
       syncFullHistory: false,
       markOnlineOnConnect: true,
       connectTimeoutMs: 60000,
@@ -187,10 +185,9 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
     created.ev.on('connection.update', async (u) => {
       const { connection, lastDisconnect, qr } = u || {};
 
-      /* --- QR event --- */
       if (qr && state.mode === 'qr') {
         try {
-          state.qr = qr;                         // raw string
+          state.qr = qr;
           state.qr_image = await QRCode.toDataURL(qr, {
             margin: 1,
             width: 512,
@@ -203,7 +200,6 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
         }
       }
 
-      /* --- Connected --- */
       if (connection === 'open') {
         const user = created.user || {};
         const phone = (user.id || '').split(':')[0].split('@')[0];
@@ -218,7 +214,6 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
         logger.info({ phone }, 'connected');
       }
 
-      /* --- Closed --- */
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || 'connection closed';
@@ -247,7 +242,6 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
       }
     });
 
-    /* --- Inbound messages --- */
     created.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
       for (const m of messages) {
@@ -265,7 +259,6 @@ async function startSocket(mode = 'qr', pairingPhone = '') {
       }
     });
 
-    /* --- Pairing mode: wait for socket ready, then request code --- */
     if (mode === 'pair' && pairingPhone) {
       try {
         await waitSocketOpen(created, 30000);
@@ -332,8 +325,6 @@ async function resetSocket() {
     phone: '', name: '', connected_at: 0,
     last_error: '', mode: '',
   });
-
-  // Do NOT auto-restart; the panel calls /connect next.
 }
 
 /* ------------------------------ sending --------------------------------- */
@@ -420,7 +411,6 @@ async function sendOne(payload) {
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-/* Optional shared-secret protection */
 app.use((req, res, next) => {
   if (!API_TOKEN) return next();
   const hdr = req.headers['authorization'] || '';
@@ -438,14 +428,301 @@ const ok   = (res, x = {}) => res.json({ success: true, ...x });
 const fail = (res, m, c = 'ERROR', h = 400) =>
   res.status(h).json({ success: false, error: { code: c, message: m } });
 
-/* ---------- root ---------- */
-app.get('/', (_r, r) => r.json({
-  service: 'wa-connector',
-  version: '3.0.0',
-  status: state.status,
-}));
+/* ---------- connect page (HTML) ---------- */
+function renderConnectPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect WhatsApp</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:linear-gradient(180deg,#f0fdf4,#f7f8fa 40%);
+    font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:#111827}
+  .card{width:min(520px,calc(100% - 32px));background:#fff;border:1px solid #e5e7eb;
+    border-radius:20px;padding:32px;box-shadow:0 20px 60px rgba(0,0,0,.08)}
+  .logo{width:56px;height:56px;border-radius:15px;background:#25D366;color:#fff;
+    display:grid;place-items:center;font-weight:900;font-size:22px;margin-bottom:18px}
+  h1{margin:0 0 6px;font-size:22px}
+  p.sub{color:#6b7280;margin:0 0 22px;font-size:14px}
+  .tabs{display:flex;gap:6px;background:#f3f4f6;border-radius:10px;padding:4px;margin-bottom:20px}
+  .tab{flex:1;padding:9px;border-radius:7px;font-weight:700;font-size:13px;color:#6b7280;
+    cursor:pointer;text-align:center;user-select:none}
+  .tab.active{background:#fff;color:#111827;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  .pane{display:none}
+  .pane.active{display:block}
+  .qrbox{width:260px;height:260px;margin:0 auto 16px;border:1px solid #e5e7eb;
+    border-radius:14px;background:#fff;display:flex;align-items:center;justify-content:center;
+    overflow:hidden;position:relative}
+  .qrbox img{width:100%;height:100%;object-fit:contain}
+  .spin{width:38px;height:38px;border:3px solid #e5e7eb;border-top-color:#25D366;
+    border-radius:50%;animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .status{text-align:center;font-weight:700;font-size:14px;margin-bottom:6px}
+  .hint{text-align:center;color:#6b7280;font-size:12.5px;line-height:1.6;margin-bottom:14px}
+  .steps{background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px;
+    font-size:12.5px;color:#374151;line-height:1.9}
+  .steps b{color:#111827}
+  .input{width:100%;padding:11px 12px;border:1px solid #d1d5db;border-radius:9px;
+    font-size:14px;outline:none;margin-bottom:10px}
+  .input:focus{border-color:#86efac;box-shadow:0 0 0 3px rgba(37,211,102,.12)}
+  button{width:100%;padding:11px;border:0;border-radius:9px;font-weight:700;font-size:14px;
+    cursor:pointer;transition:.15s}
+  .btn-primary{background:#25D366;color:#fff}
+  .btn-primary:hover{background:#18a957}
+  .btn-danger{background:#fff;border:1px solid #fecaca;color:#dc2626;margin-top:10px}
+  .btn-danger:hover{background:#fef2f2}
+  .btn-ghost{background:#f3f4f6;color:#374151;margin-top:8px}
+  .btn-ghost:hover{background:#e5e7eb}
+  .paircode{font-family:ui-monospace,Menlo,monospace;font-size:30px;font-weight:900;
+    letter-spacing:6px;text-align:center;padding:20px;background:#f0fdf4;
+    border:1px dashed #4ade80;border-radius:12px;margin-top:14px;display:none}
+  .paircode.show{display:block}
+  .error{color:#dc2626;font-size:13px;text-align:center;margin-top:10px}
+  .ok{color:#059669;font-size:13px;text-align:center;margin-top:10px}
+  .foot{margin-top:20px;font-size:12px;color:#9ca3af;text-align:center}
+  .foot a{color:#6b7280;text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">WA</div>
+  <h1>Connect WhatsApp</h1>
+  <p class="sub">Choose a method to link your WhatsApp account.</p>
 
-/* ---------- status ---------- */
+  <div class="tabs">
+    <div class="tab active" data-tab="qr">📷 QR Code</div>
+    <div class="tab" data-tab="pair">🔢 Pairing Code</div>
+  </div>
+
+  <div class="pane active" id="pane-qr">
+    <div class="qrbox" id="qrbox"><div class="spin"></div></div>
+    <div class="status" id="status">Generating QR…</div>
+    <div class="hint" id="hint">Waiting for connector to issue a QR code.</div>
+    <div class="steps">
+      <b>1.</b> Open WhatsApp on your phone<br>
+      <b>2.</b> Settings → Linked Devices<br>
+      <b>3.</b> Tap “Link a Device” and scan this code
+    </div>
+    <button class="btn-primary" id="newqr" style="margin-top:14px;display:none">Generate New QR</button>
+  </div>
+
+  <div class="pane" id="pane-pair">
+    <p class="sub">Enter your WhatsApp number with country code (no + or spaces).</p>
+    <input class="input" id="phone" placeholder="e.g. 916002322737" inputmode="numeric">
+    <button class="btn-primary" id="getpair">Get Pairing Code</button>
+    <div class="paircode" id="paircode"></div>
+    <div class="error" id="pairerr"></div>
+  </div>
+
+  <button class="btn-danger" id="resetbtn">Reset Session</button>
+  <button class="btn-ghost" id="disconnectbtn">Disconnect</button>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+
+async function api(action, opts) {
+  opts = opts || {};
+  const url = 'index.php?action=' + action;
+  const res = await fetch(opts.endpoint || url, {
+    method: opts.method || 'GET',
+    headers: opts.body ? { 'Content-Type': 'application/json' } : {},
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    credentials: 'same-origin'
+  });
+  const j = await res.json();
+  if (!j.success) throw (j.error || { message: 'Request failed.' });
+  return j;
+}
+
+async function fetchStatus() {
+  try {
+    const r = await fetch('/status');
+    const j = await r.json();
+    return j;
+  } catch (e) { return { status: 'offline' }; }
+}
+
+async function fetchQr() {
+  try {
+    const r = await fetch('/qr-image');
+    const j = await r.json();
+    return j;
+  } catch (e) { return { status: 'offline', qr: '' }; }
+}
+
+/* ----- tab switching ----- */
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
+    document.querySelectorAll('.pane').forEach(p => {
+      p.classList.toggle('active', p.id === 'pane-' + t.dataset.tab);
+    });
+    if (t.dataset.tab === 'qr') startQrLoop();
+  });
+});
+
+/* ----- QR loop ----- */
+let qrLoop = null;
+let qrTicks = 0;
+let qrFails = 0;
+
+function stopQrLoop() {
+  if (qrLoop) { clearInterval(qrLoop); qrLoop = null; }
+}
+
+async function startQrLoop() {
+  stopQrLoop();
+  qrTicks = 0; qrFails = 0;
+  $('newqr').style.display = 'none';
+  $('qrbox').innerHTML = '<div class="spin"></div>';
+  $('status').textContent = 'Generating QR…';
+  $('hint').textContent = 'Waiting for connector to issue a QR code.';
+
+  try { await fetch('/connect', { method: 'POST' }); } catch (e) {}
+
+  const tick = async () => {
+    qrTicks++;
+    try {
+      const s = await fetchStatus();
+
+      if (s.status === 'connected') {
+        stopQrLoop();
+        $('qrbox').innerHTML = '<div style="font-size:52px">✓</div>';
+        $('status').textContent = 'WhatsApp Connected';
+        $('hint').textContent = s.phone ? ('+' + s.phone) : '';
+        $('foot').innerHTML = '<a href="/status" target="_blank">View status JSON</a>';
+        return;
+      }
+
+      if (s.status === 'qr') {
+        const q = await fetchQr();
+        if (q.qr) {
+          $('qrbox').innerHTML = '<img alt="QR" src="' + q.qr + '">';
+          $('status').textContent = 'Waiting for scan…';
+          $('hint').textContent = 'Open WhatsApp → Linked Devices → Link a Device.';
+          $('newqr').style.display = 'none';
+        }
+        return;
+      }
+
+      if (s.status === 'connecting') {
+        $('qrbox').innerHTML = '<div class="spin"></div>';
+        $('status').textContent = 'Generating QR…';
+        return;
+      }
+
+      if (qrTicks > 8) {
+        $('qrbox').innerHTML = '<div style="color:#9ca3af;font-size:13px;padding:20px;text-align:center">QR unavailable</div>';
+        $('status').textContent = 'QR expired';
+        $('hint').textContent = 'Click “Generate New QR” to try again.';
+        $('newqr').style.display = 'inline-block';
+        stopQrLoop();
+      }
+    } catch (e) {
+      qrFails++;
+      if (qrFails > 3) {
+        $('qrbox').innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">Connector offline</div>';
+        $('status').textContent = 'Connector Offline';
+        stopQrLoop();
+      }
+    }
+  };
+
+  await tick();
+  qrLoop = setInterval(tick, 2500);
+}
+
+/* ----- pairing ----- */
+$('getpair').addEventListener('click', async () => {
+  const phone = ($('phone').value || '').replace(/\D/g, '');
+  if (phone.length < 8) {
+    $('pairerr').textContent = 'Enter a valid phone with country code.';
+    return;
+  }
+  $('pairerr').textContent = '';
+  $('paircode').classList.remove('show');
+  $('getpair').disabled = true;
+  $('getpair').textContent = 'Requesting…';
+
+  try {
+    const r = await fetch('/pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone })
+    });
+    const j = await r.json();
+    if (!j.success) throw (j.error || { message: 'Pairing failed.' });
+    $('paircode').textContent = j.code;
+    $('paircode').classList.add('show');
+    startPairWatch();
+  } catch (e) {
+    $('pairerr').textContent = e.message || 'Pairing failed.';
+  } finally {
+    $('getpair').disabled = false;
+    $('getpair').textContent = 'Get Pairing Code';
+  }
+});
+
+function startPairWatch() {
+  stopQrLoop();
+  qrLoop = setInterval(async () => {
+    try {
+      const s = await fetchStatus();
+      if (s.status === 'connected') {
+        stopQrLoop();
+        document.querySelector('.tab[data-tab="qr"]').click();
+      }
+    } catch (e) {}
+  }, 2500);
+}
+
+/* ----- reset & disconnect ----- */
+$('newqr').addEventListener('click', startQrLoop);
+
+$('resetbtn').addEventListener('click', async () => {
+  if (!confirm('Reset the session? This wipes auth and forces a fresh QR.')) return;
+  try { await fetch('/reset', { method: 'POST' }); } catch (e) {}
+  startQrLoop();
+});
+
+$('disconnectbtn').addEventListener('click', async () => {
+  if (!confirm('Disconnect the current WhatsApp session?')) return;
+  try { await fetch('/disconnect', { method: 'POST' }); } catch (e) {}
+  startQrLoop();
+});
+
+/* ----- boot ----- */
+(async () => {
+  const s = await fetchStatus();
+  if (s.status === 'connected') {
+    $('qrbox').innerHTML = '<div style="font-size:52px">✓</div>';
+    $('status').textContent = 'WhatsApp Connected';
+    $('hint').textContent = s.phone ? ('+' + s.phone) : '';
+    $('foot').innerHTML = '<a href="/status" target="_blank">View status JSON</a>';
+    return;
+  }
+  startQrLoop();
+})();
+</script>
+</body>
+</html>`;
+}
+
+/* ---------- routes ---------- */
+app.get('/', (_r, r) => r.redirect('/connect'));
+
+app.get('/connect', (_r, r) => {
+  r.set('Content-Type', 'text/html; charset=utf-8');
+  r.send(renderConnectPage());
+});
+
 app.get('/status', (_r, r) => ok(r, {
   status: state.status,
   phone: state.phone,
@@ -456,7 +733,6 @@ app.get('/status', (_r, r) => ok(r, {
   last_error: state.last_error,
 }));
 
-/* ---------- QR ---------- */
 app.get('/qr', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   if (state.qr) {
@@ -473,7 +749,6 @@ app.get('/qr', async (_r, r) => {
   });
 });
 
-/* ---------- QR as base64 image (always) ---------- */
 app.get('/qr-image', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   if (state.qr_image) {
@@ -490,14 +765,12 @@ app.get('/qr-image', async (_r, r) => {
   });
 });
 
-/* ---------- connect ---------- */
 app.post('/connect', async (_r, r) => {
   if (state.status === 'connected') return ok(r, { status: 'connected' });
   startSocket('qr').catch(() => {});
   ok(r, { status: 'connecting' });
 });
 
-/* ---------- pairing ---------- */
 app.post('/pair', async (req, res) => {
   const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
   if (phone.length < 8 || phone.length > 15) {
@@ -518,7 +791,6 @@ app.post('/pair', async (req, res) => {
   }
 });
 
-/* ---------- disconnect ---------- */
 app.post('/disconnect', async (_r, r) => {
   try {
     await disconnectSocket();
@@ -528,7 +800,6 @@ app.post('/disconnect', async (_r, r) => {
   }
 });
 
-/* ---------- reset (POST + GET) ---------- */
 const resetHandler = async (_r, r) => {
   try {
     await resetSocket();
@@ -540,7 +811,6 @@ const resetHandler = async (_r, r) => {
 app.post('/reset', resetHandler);
 app.get('/reset',  resetHandler);
 
-/* ---------- send ---------- */
 async function handleSend(req, res) {
   try {
     const id = await sendOne(req.body || {});
@@ -557,7 +827,6 @@ async function handleSend(req, res) {
 app.post('/send-message', handleSend);
 app.post('/send-media',   handleSend);
 
-/* ---------- healthcheck for Railway ---------- */
 app.get('/health', (_r, r) => r.json({ ok: true, status: state.status }));
 
 /* ------------------------------ watchdog -------------------------------- */
@@ -566,14 +835,12 @@ function startWatchdog() {
   watchdog = setInterval(() => {
     const stuckFor = Date.now() - state.last_change;
 
-    /* Stuck in "connecting" for too long → restart */
     if (state.status === 'connecting' && stuckFor > 40000) {
       logger.warn({ stuckFor }, 'stuck in connecting — restarting');
       startSocket(state.mode || 'qr').catch(() => {});
       return;
     }
 
-    /* QR expired → regenerate */
     if (
       state.status === 'qr' &&
       state.qr_expires_at &&
@@ -589,7 +856,6 @@ function startWatchdog() {
 (async () => {
   startWatchdog();
 
-  /* Auto-resume only if we have a real creds file */
   if (fs.existsSync(AUTH_DIR)) {
     try {
       const files = fs.readdirSync(AUTH_DIR);
@@ -603,6 +869,7 @@ function startWatchdog() {
   app.listen(PORT, HOST, () => {
     logger.info(`wa-connector v3.0.0 listening on http://${HOST}:${PORT}`);
     logger.info(`auth dir: ${AUTH_DIR}`);
+    logger.info(`connect page: http://${HOST}:${PORT}/connect`);
     if (API_TOKEN) logger.info('API_TOKEN protection enabled');
     if (PANEL_HOOK) logger.info(`forwarding events to ${PANEL_HOOK}`);
   });
