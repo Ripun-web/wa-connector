@@ -1,9 +1,12 @@
 /**
+ * ============================================================
  * WhatsApp Multi-Account Connector
- * --------------------------------
- * NO API TOKEN / AUTHENTICATION
+ * ============================================================
  *
- * Endpoints:
+ * NO API KEY
+ * NO AUTHENTICATION
+ *
+ * Same endpoints:
  *
  * GET  /
  * GET  /health
@@ -17,17 +20,24 @@
  * POST /send-message
  * POST /send-media
  *
- * Account:
- *   ?account=user1
- *   X-Account-ID: user1
- *   JSON: { "account": "user1" }
+ * NEW:
+ * POST /send-to-all
  *
- * Environment:
- *   PORT=3000
- *   DEFAULT_COUNTRY=91
- *   AUTH_DIR=./auth
- *   QR_TTL_MS=300000
- *   LOG_LEVEL=info
+ * FEATURES:
+ * - Multi account
+ * - Persistent Baileys sessions
+ * - QR login
+ * - Pairing code
+ * - Automatic reconnect
+ * - Message sending
+ * - Media sending
+ * - Broadcast to supplied recipients
+ * - First-message auto reply
+ * - Persistent replied-user tracking
+ * - Automatic unavailable presence after inactivity
+ * - Graceful shutdown
+ *
+ * ============================================================
  */
 
 'use strict';
@@ -48,75 +58,198 @@ const {
   Browsers
 } = require('@whiskeysockets/baileys');
 
+
+/* ============================================================
+   APP
+   ============================================================ */
+
 const app = express();
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT =
+  Number(process.env.PORT || 3000);
+
+const HOST =
+  String(process.env.HOST || '0.0.0.0');
 
 const DEFAULT_COUNTRY =
-  String(process.env.DEFAULT_COUNTRY || '91')
+  String(
+    process.env.DEFAULT_COUNTRY || '91'
+  )
     .replace(/\D/g, '') || '91';
 
-const AUTH_DIR = path.resolve(
-  process.env.AUTH_DIR || './auth'
-);
+const AUTH_DIR =
+  path.resolve(
+    process.env.AUTH_DIR || './auth_info'
+  );
 
-const QR_TTL_MS = Number(
-  process.env.QR_TTL_MS || 5 * 60 * 1000
-);
+const QR_TTL_MS =
+  Number(
+    process.env.QR_TTL_MS ||
+    5 * 60 * 1000
+  );
 
 const LOG_LEVEL =
   process.env.LOG_LEVEL || 'info';
 
-const logger = P({
-  level: LOG_LEVEL,
-  base: undefined,
-  timestamp: P.stdTimeFunctions.isoTime
-});
+const RECONNECT_DELAY_MS =
+  Number(
+    process.env.RECONNECT_DELAY_MS ||
+    5000
+  );
+
+const MAX_RECONNECT_DELAY_MS =
+  Number(
+    process.env.MAX_RECONNECT_DELAY_MS ||
+    60000
+  );
+
+const JSON_LIMIT =
+  process.env.JSON_LIMIT ||
+  '5mb';
+
+
+/*
+ * How long an account can stay inactive
+ * before presence becomes unavailable.
+ *
+ * Default: 5 minutes.
+ */
+const IDLE_TIMEOUT_MS =
+  Number(
+    process.env.IDLE_TIMEOUT_MS ||
+    5 * 60 * 1000
+  );
+
+
+/*
+ * Auto reply.
+ */
+const AUTO_REPLY_ENABLED =
+  String(
+    process.env.AUTO_REPLY_ENABLED ?? 'true'
+  ).toLowerCase() !== 'false';
+
+const AUTO_REPLY_TEXT =
+  String(
+    process.env.AUTO_REPLY_TEXT ||
+    "Thanks for your message! 💬\n\nRipun is currently offline. He’ll reply as soon as possible. 😊"
+  );
+
+
+/* ============================================================
+   LOGGER
+   ============================================================ */
+
+const logger =
+  P({
+    level: LOG_LEVEL,
+    base: undefined,
+    timestamp:
+      P.stdTimeFunctions.isoTime
+  });
+
+
+/* ============================================================
+   EXPRESS
+   ============================================================ */
 
 app.disable('x-powered-by');
 
-app.use(cors({
-  origin: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'X-Account-ID',
-    'X-Connection-ID'
-  ]
-}));
+app.use(
+  cors({
+    origin: true,
+    methods: [
+      'GET',
+      'POST',
+      'OPTIONS'
+    ],
+    allowedHeaders: [
+      'Content-Type',
+      'X-Account-ID',
+      'X-Connection-ID'
+    ]
+  })
+);
 
-app.use(express.json({
-  limit: '2mb'
-}));
+app.use(
+  express.json({
+    limit: JSON_LIMIT
+  })
+);
 
-app.use(express.urlencoded({
-  extended: true,
-  limit: '2mb'
-}));
-
-fs.mkdirSync(AUTH_DIR, {
-  recursive: true
-});
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: JSON_LIMIT
+  })
+);
 
 
-/* =========================================================
+/* ============================================================
+   DIRECTORIES
+   ============================================================ */
+
+fs.mkdirSync(
+  AUTH_DIR,
+  {
+    recursive: true
+  }
+);
+
+
+/*
+ * Separate data directory.
+ *
+ * This stores:
+ *
+ * data/
+ *   user1/
+ *      replied.json
+ *
+ * This allows first-message tracking
+ * to survive restarts.
+ */
+const DATA_DIR =
+  path.resolve(
+    process.env.DATA_DIR || './data'
+  );
+
+fs.mkdirSync(
+  DATA_DIR,
+  {
+    recursive: true
+  }
+);
+
+
+/* ============================================================
    ACCOUNT STORAGE
-   ========================================================= */
+   ============================================================ */
 
-const accounts = new Map();
+const accounts =
+  new Map();
 
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
 
 function cleanAccountId(value) {
 
-  const id = String(value || '').trim();
+  const id =
+    String(value || '').trim();
 
   if (!id) {
     return 'user1';
   }
 
-  const safe = id
-    .replace(/[^a-zA-Z0-9_-]/g, '')
-    .slice(0, 64);
+  const safe =
+    id
+      .replace(
+        /[^a-zA-Z0-9_-]/g,
+        ''
+      )
+      .slice(0, 64);
 
   return safe || 'user1';
 }
@@ -147,56 +280,224 @@ function authPath(account) {
 }
 
 
+function dataPath(account) {
+
+  const dir =
+    path.join(
+      DATA_DIR,
+      account
+    );
+
+  fs.mkdirSync(
+    dir,
+    {
+      recursive: true
+    }
+  );
+
+  return dir;
+}
+
+
+function repliedPath(account) {
+
+  return path.join(
+    dataPath(account),
+    'replied.json'
+  );
+
+}
+
+
 function createAccountState(account) {
 
   if (!accounts.has(account)) {
 
-    accounts.set(account, {
+    accounts.set(
+      account,
+      {
 
-      id: account,
+        id: account,
 
-      sock: null,
+        sock: null,
 
-      connecting: false,
+        connecting: false,
 
-      connected: false,
+        connected: false,
 
-      status: 'disconnected',
+        status: 'disconnected',
 
-      phone: null,
+        phone: null,
 
-      jid: null,
+        jid: null,
 
-      qr: null,
+        qr: null,
 
-      qrImage: null,
+        qrImage: null,
 
-      qrCreatedAt: null,
+        qrCreatedAt: null,
 
-      qrExpiresAt: null,
+        qrExpiresAt: null,
 
-      pairingCode: null,
+        pairingCode: null,
 
-      pairingCreatedAt: null,
+        pairingCreatedAt: null,
 
-      connectedAt: null,
+        connectedAt: null,
 
-      lastDisconnect: null,
+        lastDisconnect: null,
 
-      lastError: null,
+        lastError: null,
 
-      reconnectTimer: null,
+        reconnectTimer: null,
 
-      generation: 0
+        reconnectDelay:
+          RECONNECT_DELAY_MS,
 
-    });
+        generation: 0,
+
+        lastActivity:
+          null,
+
+        isAvailable:
+          false,
+
+        idleTimer:
+          null,
+
+        repliedUsers:
+          loadRepliedUsers(account),
+
+        incomingMessages:
+          0,
+
+        outgoingMessages:
+          0,
+
+        autoReplies:
+          0
+
+      }
+    );
 
   }
 
   return accounts.get(account);
+}
+
+
+/* ============================================================
+   REPLIED USER STORAGE
+   ============================================================ */
+
+function loadRepliedUsers(account) {
+
+  const file =
+    repliedPath(account);
+
+  try {
+
+    if (
+      !fs.existsSync(file)
+    ) {
+
+      return {};
+
+    }
+
+    const raw =
+      fs.readFileSync(
+        file,
+        'utf8'
+      );
+
+    const parsed =
+      JSON.parse(raw);
+
+    if (
+      parsed &&
+      typeof parsed === 'object'
+    ) {
+
+      return parsed;
+
+    }
+
+  } catch (err) {
+
+    logger.warn(
+      {
+        account,
+        err: String(err)
+      },
+      'Could not load replied users'
+    );
+
+  }
+
+  return {};
+}
+
+
+function saveRepliedUsers(state) {
+
+  try {
+
+    fs.writeFileSync(
+      repliedPath(state.id),
+      JSON.stringify(
+        state.repliedUsers,
+        null,
+        2
+      ),
+      'utf8'
+    );
+
+  } catch (err) {
+
+    logger.error(
+      {
+        account: state.id,
+        err: String(err)
+      },
+      'Could not save replied users'
+    );
+
+  }
 
 }
 
+
+function hasReceivedAutoReply(
+  state,
+  phone
+) {
+
+  return Boolean(
+    state.repliedUsers[phone]
+  );
+
+}
+
+
+function markAutoReplySent(
+  state,
+  phone
+) {
+
+  state.repliedUsers[phone] = {
+    replied_at:
+      new Date().toISOString()
+  };
+
+  saveRepliedUsers(state);
+
+}
+
+
+/* ============================================================
+   QR
+   ============================================================ */
 
 function clearQR(state) {
 
@@ -222,128 +523,82 @@ function clearPairing(state) {
 
 function qrIsValid(state) {
 
-  return !!(
+  return Boolean(
     state.qr &&
     state.qrImage &&
     state.qrExpiresAt &&
-    Date.now() < state.qrExpiresAt
+    Date.now() <
+      state.qrExpiresAt
   );
 
 }
 
 
-function getStatus(state) {
-
-  return {
-
-    success: true,
-
-    account: state.id,
-
-    status: state.status,
-
-    connected: state.connected,
-
-    phone: state.phone,
-
-    jid: state.jid,
-
-    qr_available: qrIsValid(state),
-
-    qr_created_at:
-      state.qrCreatedAt
-        ? new Date(
-            state.qrCreatedAt
-          ).toISOString()
-        : null,
-
-    expires_at:
-      state.qrExpiresAt
-        ? new Date(
-            state.qrExpiresAt
-          ).toISOString()
-        : null,
-
-    pairing_code: state.pairingCode,
-
-    pairing_created_at:
-      state.pairingCreatedAt
-        ? new Date(
-            state.pairingCreatedAt
-          ).toISOString()
-        : null,
-
-    connected_at:
-      state.connectedAt
-        ? new Date(
-            state.connectedAt
-          ).toISOString()
-        : null,
-
-    last_disconnect:
-      state.lastDisconnect,
-
-    error:
-      state.lastError
-
-  };
-
-}
-
-
-/* =========================================================
-   PHONE HELPERS
-   ========================================================= */
+/* ============================================================
+   PHONE
+   ============================================================ */
 
 function normalizePhone(input) {
 
-  let value = String(input || '').trim();
+  let value =
+    String(input || '').trim();
 
   if (!value) {
+
     throw new Error(
       'Phone number is required'
     );
+
   }
 
-  value = value.replace(
-    /[^\d+]/g,
-    ''
-  );
+  value =
+    value.replace(
+      /[^\d+]/g,
+      ''
+    );
 
-  if (value.startsWith('+')) {
-    value = value.slice(1);
+  if (
+    value.startsWith('+')
+  ) {
+
+    value =
+      value.slice(1);
+
   }
 
-  if (value.startsWith('00')) {
-    value = value.slice(2);
+  if (
+    value.startsWith('00')
+  ) {
+
+    value =
+      value.slice(2);
+
   }
 
   let digits =
-    value.replace(/\D/g, '');
+    value.replace(
+      /\D/g,
+      ''
+    );
 
   if (!digits) {
+
     throw new Error(
       'Invalid phone number'
     );
+
   }
 
-  /*
-   * India example:
-   *
-   * 9876543210
-   * ->
-   * 919876543210
-   *
-   * 919876543210
-   * ->
-   * 919876543210
-   */
-
-  if (digits.length <= 10) {
+  if (
+    digits.length <= 10
+  ) {
 
     digits =
       DEFAULT_COUNTRY +
-      digits.replace(/^0+/, '');
+      digits.replace(
+        /^0+/,
+        ''
+      );
 
   }
 
@@ -378,36 +633,442 @@ function extractPhoneFromJid(jid) {
 }
 
 
-/* =========================================================
-   CREATE BAILEYS SOCKET
-   ========================================================= */
+/* ============================================================
+   PRESENCE / ONLINE STATUS
+   ============================================================ */
+
+function clearIdleTimer(state) {
+
+  if (
+    state.idleTimer
+  ) {
+
+    clearTimeout(
+      state.idleTimer
+    );
+
+    state.idleTimer =
+      null;
+
+  }
+
+}
+
+
+async function setUnavailable(state) {
+
+  if (
+    !state.sock ||
+    !state.connected
+  ) {
+
+    return;
+
+  }
+
+  try {
+
+    await state.sock
+      .sendPresenceUpdate(
+        'unavailable'
+      );
+
+    state.isAvailable =
+      false;
+
+    logger.debug(
+      {
+        account: state.id
+      },
+      'Account marked unavailable'
+    );
+
+  } catch (err) {
+
+    logger.debug(
+      {
+        account: state.id,
+        err: String(err)
+      },
+      'Could not update unavailable presence'
+    );
+
+  }
+
+}
+
+
+function scheduleIdlePresence(state) {
+
+  clearIdleTimer(state);
+
+  state.idleTimer =
+    setTimeout(
+      async () => {
+
+        state.idleTimer =
+          null;
+
+        await setUnavailable(
+          state
+        );
+
+      },
+      IDLE_TIMEOUT_MS
+    );
+
+}
+
+
+async function markActive(state) {
+
+  state.lastActivity =
+    Date.now();
+
+  if (
+    state.sock &&
+    state.connected
+  ) {
+
+    try {
+
+      await state.sock
+        .sendPresenceUpdate(
+          'available'
+        );
+
+      state.isAvailable =
+        true;
+
+    } catch (_) {}
+
+  }
+
+  scheduleIdlePresence(
+    state
+  );
+
+}
+
+
+/* ============================================================
+   STATUS
+   ============================================================ */
+
+function getStatus(state) {
+
+  return {
+
+    success: true,
+
+    account:
+      state.id,
+
+    status:
+      state.status,
+
+    connected:
+      state.connected,
+
+    available:
+      state.isAvailable,
+
+    phone:
+      state.phone,
+
+    jid:
+      state.jid,
+
+    qr_available:
+      qrIsValid(state),
+
+    qr_created_at:
+      state.qrCreatedAt
+        ? new Date(
+            state.qrCreatedAt
+          ).toISOString()
+        : null,
+
+    expires_at:
+      state.qrExpiresAt
+        ? new Date(
+            state.qrExpiresAt
+          ).toISOString()
+        : null,
+
+    pairing_code:
+      state.pairingCode,
+
+    pairing_created_at:
+      state.pairingCreatedAt
+        ? new Date(
+            state.pairingCreatedAt
+          ).toISOString()
+        : null,
+
+    connected_at:
+      state.connectedAt
+        ? new Date(
+            state.connectedAt
+          ).toISOString()
+        : null,
+
+    last_activity:
+      state.lastActivity
+        ? new Date(
+            state.lastActivity
+          ).toISOString()
+        : null,
+
+    incoming_messages:
+      state.incomingMessages,
+
+    outgoing_messages:
+      state.outgoingMessages,
+
+    auto_replies:
+      state.autoReplies,
+
+    remembered_recipients:
+      Object.keys(
+        state.repliedUsers
+      ).length,
+
+    last_disconnect:
+      state.lastDisconnect,
+
+    error:
+      state.lastError
+
+  };
+
+}
+
+
+/* ============================================================
+   AUTO REPLY
+   ============================================================ */
+
+async function processIncomingMessage(
+  state,
+  message
+) {
+
+  try {
+
+    if (
+      !AUTO_REPLY_ENABLED
+    ) {
+
+      return;
+
+    }
+
+    if (
+      !message ||
+      message.key?.fromMe
+    ) {
+
+      return;
+
+    }
+
+    const remoteJid =
+      message.key?.remoteJid;
+
+    if (!remoteJid) {
+      return;
+    }
+
+
+    /*
+     * Ignore groups.
+     */
+    if (
+      remoteJid.endsWith(
+        '@g.us'
+      )
+    ) {
+
+      return;
+
+    }
+
+
+    /*
+     * Ignore broadcast/system chats.
+     */
+    if (
+      remoteJid ===
+      'status@broadcast'
+    ) {
+
+      return;
+
+    }
+
+
+    const phone =
+      extractPhoneFromJid(
+        remoteJid
+      );
+
+    if (!phone) {
+      return;
+    }
+
+
+    state.incomingMessages += 1;
+
+    await markActive(
+      state
+    );
+
+
+    /*
+     * Only first incoming message
+     * from this person.
+     */
+    if (
+      hasReceivedAutoReply(
+        state,
+        phone
+      )
+    ) {
+
+      return;
+
+    }
+
+
+    /*
+     * Mark BEFORE sending.
+     *
+     * This prevents duplicate auto replies
+     * if WhatsApp emits the event twice.
+     */
+    markAutoReplySent(
+      state,
+      phone
+    );
+
+
+    try {
+
+      await state.sock.sendMessage(
+        remoteJid,
+        {
+          text:
+            AUTO_REPLY_TEXT
+        }
+      );
+
+      state.autoReplies += 1;
+
+      state.outgoingMessages += 1;
+
+      logger.info(
+        {
+          account: state.id,
+          phone
+        },
+        'First-message auto reply sent'
+      );
+
+    } catch (err) {
+
+      /*
+       * If sending failed, remove the marker
+       * so the next message can retry.
+       */
+      delete state.repliedUsers[
+        phone
+      ];
+
+      saveRepliedUsers(
+        state
+      );
+
+      logger.error(
+        {
+          account: state.id,
+          phone,
+          err: String(err)
+        },
+        'Auto reply failed'
+      );
+
+    }
+
+  } catch (err) {
+
+    logger.error(
+      {
+        account: state.id,
+        err: String(err)
+      },
+      'Incoming message processing failed'
+    );
+
+  }
+
+}
+
+
+/* ============================================================
+   CREATE SOCKET
+   ============================================================ */
 
 async function createSocket(account) {
 
   const state =
-    createAccountState(account);
+    createAccountState(
+      account
+    );
+
 
   if (state.sock) {
+
     return state.sock;
+
   }
 
-  if (
-    state.connecting &&
-    state.sock
-  ) {
-    return state.sock;
+
+  if (state.connecting) {
+
+    /*
+     * Wait for another socket creation.
+     */
+    await waitForCondition(
+      () =>
+        state.sock ||
+        !state.connecting,
+      15000
+    ).catch(() => {});
+
+    if (state.sock) {
+
+      return state.sock;
+
+    }
+
   }
 
-  state.connecting = true;
 
-  state.status = 'connecting';
+  state.connecting =
+    true;
 
-  state.lastError = null;
+  state.status =
+    'connecting';
+
+  state.lastError =
+    null;
 
   state.generation += 1;
 
   const myGeneration =
     state.generation;
+
 
   const accountAuthDir =
     authPath(account);
@@ -419,21 +1080,17 @@ async function createSocket(account) {
     }
   );
 
-  let authState;
-
-  let version;
 
   try {
 
-    authState =
+    const authState =
       await useMultiFileAuthState(
         accountAuthDir
       );
 
 
-    /*
-     * Get latest Baileys WhatsApp version.
-     */
+    let version;
+
 
     try {
 
@@ -480,7 +1137,9 @@ async function createSocket(account) {
       },
 
       browser:
-        Browsers.ubuntu('Chrome'),
+        Browsers.ubuntu(
+          'Chrome'
+        ),
 
       printQRInTerminal:
         false,
@@ -520,30 +1179,67 @@ async function createSocket(account) {
       false;
 
 
-    /*
-     * Save Baileys authentication.
-     */
-
     sock.ev.on(
       'creds.update',
       authState.saveCreds
     );
 
 
-    /*
-     * Connection events.
-     */
+    /* ========================================================
+       INCOMING MESSAGES
+       ======================================================== */
+
+    sock.ev.on(
+      'messages.upsert',
+      async ({
+        messages,
+        type
+      }) => {
+
+        /*
+         * Handle notify messages.
+         */
+        if (
+          type !== 'notify'
+        ) {
+
+          return;
+
+        }
+
+        for (
+          const message of
+          messages || []
+        ) {
+
+          await processIncomingMessage(
+            state,
+            message
+          );
+
+        }
+
+      }
+    );
+
+
+    /* ========================================================
+       CONNECTION EVENTS
+       ======================================================== */
 
     sock.ev.on(
       'connection.update',
-      async (update) => {
+      async update => {
 
         if (
           state.generation !==
           myGeneration
         ) {
+
           return;
+
         }
+
 
         const {
           connection,
@@ -552,9 +1248,9 @@ async function createSocket(account) {
         } = update;
 
 
-        /*
-         * QR generated
-         */
+        /* ----------------------------------------------------
+           QR
+        ---------------------------------------------------- */
 
         if (qr) {
 
@@ -575,7 +1271,8 @@ async function createSocket(account) {
               await QRCode.toDataURL(
                 qr,
                 {
-                  errorCorrectionLevel: 'M',
+                  errorCorrectionLevel:
+                    'M',
                   margin: 2,
                   width: 420
                 }
@@ -593,7 +1290,6 @@ async function createSocket(account) {
               'New QR generated'
             );
 
-
           } catch (err) {
 
             state.lastError =
@@ -602,22 +1298,14 @@ async function createSocket(account) {
                 err
               );
 
-            logger.error(
-              {
-                account,
-                err: String(err)
-              },
-              'QR generation failed'
-            );
-
           }
 
         }
 
 
-        /*
-         * Connected
-         */
+        /* ----------------------------------------------------
+           OPEN
+        ---------------------------------------------------- */
 
         if (
           connection === 'open'
@@ -641,10 +1329,17 @@ async function createSocket(account) {
           state.lastError =
             null;
 
+          state.reconnectDelay =
+            RECONNECT_DELAY_MS;
 
-          clearQR(state);
 
-          clearPairing(state);
+          clearQR(
+            state
+          );
+
+          clearPairing(
+            state
+          );
 
 
           state.jid =
@@ -655,6 +1350,11 @@ async function createSocket(account) {
             extractPhoneFromJid(
               state.jid
             );
+
+
+          await markActive(
+            state
+          );
 
 
           logger.info(
@@ -669,9 +1369,9 @@ async function createSocket(account) {
         }
 
 
-        /*
-         * Disconnected
-         */
+        /* ----------------------------------------------------
+           CLOSE
+        ---------------------------------------------------- */
 
         if (
           connection === 'close'
@@ -685,6 +1385,14 @@ async function createSocket(account) {
 
           state.connecting =
             false;
+
+          state.isAvailable =
+            false;
+
+
+          clearIdleTimer(
+            state
+          );
 
 
           const errorCode =
@@ -701,7 +1409,8 @@ async function createSocket(account) {
           state.lastDisconnect = {
 
             at:
-              new Date().toISOString(),
+              new Date()
+                .toISOString(),
 
             code:
               errorCode,
@@ -743,11 +1452,6 @@ async function createSocket(account) {
             'WhatsApp connection closed'
           );
 
-
-          /*
-           * Automatically reconnect unless
-           * account was explicitly logged out.
-           */
 
           if (
             !loggedOut &&
@@ -803,19 +1507,35 @@ async function createSocket(account) {
 }
 
 
-/* =========================================================
+/* ============================================================
    RECONNECT
-   ========================================================= */
+   ============================================================ */
 
-function scheduleReconnect(account) {
+function scheduleReconnect(
+  account
+) {
 
   const state =
-    createAccountState(account);
+    createAccountState(
+      account
+    );
 
 
-  if (state.reconnectTimer) {
+  if (
+    state.reconnectTimer
+  ) {
+
     return;
+
   }
+
+
+  const delay =
+    Math.min(
+      state.reconnectDelay ||
+        RECONNECT_DELAY_MS,
+      MAX_RECONNECT_DELAY_MS
+    );
 
 
   state.reconnectTimer =
@@ -831,6 +1551,9 @@ function scheduleReconnect(account) {
             account
           );
 
+          state.reconnectDelay =
+            RECONNECT_DELAY_MS;
+
         } catch (err) {
 
           logger.error(
@@ -841,6 +1564,18 @@ function scheduleReconnect(account) {
             'Automatic reconnect failed'
           );
 
+
+          state.reconnectDelay =
+            Math.min(
+              Math.max(
+                state.reconnectDelay *
+                  2,
+                RECONNECT_DELAY_MS
+              ),
+              MAX_RECONNECT_DELAY_MS
+            );
+
+
           scheduleReconnect(
             account
           );
@@ -848,26 +1583,34 @@ function scheduleReconnect(account) {
         }
 
       },
-      5000
+      delay
     );
 
 }
 
 
-/* =========================================================
-   SOCKET HELPERS
-   ========================================================= */
+/* ============================================================
+   SOCKET
+   ============================================================ */
 
 async function getOrCreateSocket(
   account
 ) {
 
   const state =
-    createAccountState(account);
+    createAccountState(
+      account
+    );
 
-  if (state.sock) {
+
+  if (
+    state.sock
+  ) {
+
     return state.sock;
+
   }
+
 
   return createSocket(
     account
@@ -876,15 +1619,23 @@ async function getOrCreateSocket(
 }
 
 
+/* ============================================================
+   DISCONNECT
+   ============================================================ */
+
 async function disconnectSocket(
   account
 ) {
 
   const state =
-    createAccountState(account);
+    createAccountState(
+      account
+    );
 
 
-  if (state.reconnectTimer) {
+  if (
+    state.reconnectTimer
+  ) {
 
     clearTimeout(
       state.reconnectTimer
@@ -894,6 +1645,11 @@ async function disconnectSocket(
       null;
 
   }
+
+
+  clearIdleTimer(
+    state
+  );
 
 
   state.generation += 1;
@@ -915,10 +1671,17 @@ async function disconnectSocket(
   state.status =
     'disconnected';
 
+  state.isAvailable =
+    false;
 
-  clearQR(state);
 
-  clearPairing(state);
+  clearQR(
+    state
+  );
+
+  clearPairing(
+    state
+  );
 
 
   if (sock) {
@@ -944,12 +1707,18 @@ async function disconnectSocket(
 }
 
 
+/* ============================================================
+   RESET
+   ============================================================ */
+
 async function resetAccount(
   account
 ) {
 
   const state =
-    createAccountState(account);
+    createAccountState(
+      account
+    );
 
 
   await disconnectSocket(
@@ -999,6 +1768,13 @@ async function resetAccount(
   state.lastError =
     null;
 
+  state.repliedUsers =
+    {};
+
+  saveRepliedUsers(
+    state
+  );
+
 
   logger.info(
     {
@@ -1010,9 +1786,9 @@ async function resetAccount(
 }
 
 
-/* =========================================================
-   WAIT HELPERS
-   ========================================================= */
+/* ============================================================
+   WAIT
+   ============================================================ */
 
 function waitForCondition(
   check,
@@ -1096,11 +1872,17 @@ async function waitForQR(
 ) {
 
   const state =
-    createAccountState(account);
+    createAccountState(
+      account
+    );
 
 
-  if (qrIsValid(state)) {
+  if (
+    qrIsValid(state)
+  ) {
+
     return state;
+
   }
 
 
@@ -1120,22 +1902,24 @@ async function waitForQR(
 }
 
 
-/* =========================================================
+/* ============================================================
    RESPONSE HELPERS
-   ========================================================= */
+   ============================================================ */
 
 function ok(
   res,
   data = {}
 ) {
 
-  return res.status(200).json({
+  return res
+    .status(200)
+    .json({
 
-    success: true,
+      success: true,
 
-    ...data
+      ...data
 
-  });
+    });
 
 }
 
@@ -1148,21 +1932,23 @@ function fail(
   extra = {}
 ) {
 
-  return res.status(status).json({
+  return res
+    .status(status)
+    .json({
 
-    success: false,
+      success: false,
 
-    error: {
+      error: {
 
-      code,
+        code,
 
-      message,
+        message,
 
-      ...extra
+        ...extra
 
-    }
+      }
 
-  });
+    });
 
 }
 
@@ -1177,7 +1963,7 @@ function asyncRoute(fn) {
           fn(req, res)
         )
         .catch(
-          (err) => {
+          err => {
 
             logger.error(
               {
@@ -1216,9 +2002,9 @@ function asyncRoute(fn) {
 }
 
 
-/* =========================================================
+/* ============================================================
    ROOT
-   ========================================================= */
+   ============================================================ */
 
 app.get(
   '/',
@@ -1231,14 +2017,48 @@ app.get(
       name:
         'WhatsApp Multi-Account Connector',
 
+      version:
+        '2.0.0',
+
       status:
         'online',
+
+      authentication:
+        'none',
 
       uptime:
         process.uptime(),
 
       accounts:
         accounts.size,
+
+      features: {
+
+        multi_account:
+          true,
+
+        qr:
+          true,
+
+        pairing:
+          true,
+
+        auto_reconnect:
+          true,
+
+        auto_reply:
+          AUTO_REPLY_ENABLED,
+
+        first_message_only:
+          true,
+
+        broadcast:
+          true,
+
+        idle_presence:
+          true
+
+      },
 
       endpoints: {
 
@@ -1267,7 +2087,10 @@ app.get(
           'POST /send-message',
 
         sendMedia:
-          'POST /send-media'
+          'POST /send-media',
+
+        sendToAll:
+          'POST /send-to-all'
 
       }
 
@@ -1277,9 +2100,9 @@ app.get(
 );
 
 
-/* =========================================================
+/* ============================================================
    HEALTH
-   ========================================================= */
+   ============================================================ */
 
 app.get(
   '/health',
@@ -1289,7 +2112,11 @@ app.get(
 
       success: true,
 
-      status: 'online',
+      status:
+        'online',
+
+      authentication:
+        'none',
 
       uptime:
         process.uptime(),
@@ -1303,16 +2130,19 @@ app.get(
 );
 
 
-/* =========================================================
+/* ============================================================
    STATUS
-   ========================================================= */
+   ============================================================ */
 
 app.get(
   '/status',
   (req, res) => {
 
     const account =
-      accountIdFromRequest(req);
+      accountIdFromRequest(
+        req
+      );
+
 
     const state =
       createAccountState(
@@ -1321,16 +2151,18 @@ app.get(
 
 
     res.json(
-      getStatus(state)
+      getStatus(
+        state
+      )
     );
 
   }
 );
 
 
-/* =========================================================
+/* ============================================================
    QR
-   ========================================================= */
+   ============================================================ */
 
 app.get(
   '/qr',
@@ -1338,17 +2170,16 @@ app.get(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
+
 
       const state =
         createAccountState(
           account
         );
 
-
-      /*
-       * Already connected?
-       */
 
       if (
         state.connected
@@ -1360,9 +2191,11 @@ app.get(
 
             account,
 
-            connected: true,
+            connected:
+              true,
 
-            qr_available: false,
+            qr_available:
+              false,
 
             message:
               'Account is already connected'
@@ -1426,9 +2259,9 @@ app.get(
 );
 
 
-/* =========================================================
+/* ============================================================
    CONNECT
-   ========================================================= */
+   ============================================================ */
 
 app.post(
   '/connect',
@@ -1436,7 +2269,10 @@ app.post(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
+
 
       const state =
         createAccountState(
@@ -1450,10 +2286,6 @@ app.post(
           account
         );
 
-
-        /*
-         * Already connected.
-         */
 
         if (
           state.connected
@@ -1483,22 +2315,15 @@ app.post(
         }
 
 
-        /*
-         * Wait for QR or connection.
-         */
-
         try {
 
           await waitForCondition(
-
             () =>
               state.connected ||
               qrIsValid(state)
                 ? true
                 : null,
-
             10000
-
           );
 
         } catch (_) {}
@@ -1563,9 +2388,9 @@ app.post(
 );
 
 
-/* =========================================================
-   PAIRING CODE
-   ========================================================= */
+/* ============================================================
+   PAIR
+   ============================================================ */
 
 app.post(
   '/pair',
@@ -1573,7 +2398,9 @@ app.post(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
 
 
       let phone;
@@ -1628,25 +2455,6 @@ app.post(
           );
 
 
-        /*
-         * Pairing requires an
-         * unregistered auth state.
-         */
-
-        if (
-          sock.authState?.creds?.registered
-        ) {
-
-          return fail(
-            res,
-            409,
-            'ALREADY_REGISTERED',
-            'This account already has WhatsApp authentication. Use /reset before pairing a different number.'
-          );
-
-        }
-
-
         await new Promise(
           resolve =>
             setTimeout(
@@ -1669,7 +2477,9 @@ app.post(
           Date.now();
 
 
-        clearQR(state);
+        clearQR(
+          state
+        );
 
 
         return ok(
@@ -1689,11 +2499,17 @@ app.post(
               ).toISOString(),
 
             instructions: [
+
               'Open WhatsApp on your phone.',
+
               'Go to Settings > Linked Devices.',
+
               'Choose Link a Device.',
+
               'Choose Link with phone number instead.',
+
               `Enter the pairing code: ${code}`
+
             ]
 
           }
@@ -1726,9 +2542,9 @@ app.post(
 );
 
 
-/* =========================================================
+/* ============================================================
    DISCONNECT
-   ========================================================= */
+   ============================================================ */
 
 app.post(
   '/disconnect',
@@ -1736,7 +2552,9 @@ app.post(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
 
 
       await disconnectSocket(
@@ -1764,9 +2582,9 @@ app.post(
 );
 
 
-/* =========================================================
+/* ============================================================
    RESET
-   ========================================================= */
+   ============================================================ */
 
 app.post(
   '/reset',
@@ -1774,7 +2592,9 @@ app.post(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
 
 
       await resetAccount(
@@ -1802,9 +2622,9 @@ app.post(
 );
 
 
-/* =========================================================
+/* ============================================================
    SEND MESSAGE
-   ========================================================= */
+   ============================================================ */
 
 app.post(
   '/send-message',
@@ -1812,7 +2632,9 @@ app.post(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
 
 
       let phone;
@@ -1882,6 +2704,11 @@ app.post(
 
       try {
 
+        await markActive(
+          state
+        );
+
+
         const jid =
           jidForPhone(
             phone
@@ -1895,6 +2722,9 @@ app.post(
               text: message
             }
           );
+
+
+        state.outgoingMessages += 1;
 
 
         return ok(
@@ -1945,9 +2775,285 @@ app.post(
 );
 
 
-/* =========================================================
+/* ============================================================
+   SEND TO ALL
+   ============================================================ */
+
+/*
+ * POST /send-to-all
+ *
+ * JSON:
+ *
+ * {
+ *   "account": "user1",
+ *   "phones": [
+ *     "9876543210",
+ *     "9123456789",
+ *     "+919876543210"
+ *   ],
+ *   "message": "Hello!"
+ * }
+ *
+ */
+
+app.post(
+  '/send-to-all',
+  asyncRoute(
+    async (req, res) => {
+
+      const account =
+        accountIdFromRequest(
+          req
+        );
+
+
+      const state =
+        createAccountState(
+          account
+        );
+
+
+      if (
+        !state.connected ||
+        !state.sock
+      ) {
+
+        return fail(
+          res,
+          409,
+          'NOT_CONNECTED',
+          `Account ${account} is not connected`
+        );
+
+      }
+
+
+      const message =
+        String(
+          req.body?.message ??
+          req.body?.text ??
+          ''
+        ).trim();
+
+
+      if (!message) {
+
+        return fail(
+          res,
+          422,
+          'MESSAGE_REQUIRED',
+          'Message is required'
+        );
+
+      }
+
+
+      let input =
+        req.body?.phones ||
+        req.body?.numbers ||
+        req.body?.recipients;
+
+
+      /*
+       * Also support:
+       *
+       * "phone": "..."
+       */
+      if (
+        !input &&
+        req.body?.phone
+      ) {
+
+        input = [
+          req.body.phone
+        ];
+
+      }
+
+
+      if (
+        typeof input === 'string'
+      ) {
+
+        input =
+          input
+            .split(',')
+            .map(
+              x => x.trim()
+            )
+            .filter(Boolean);
+
+      }
+
+
+      if (
+        !Array.isArray(input) ||
+        input.length === 0
+      ) {
+
+        return fail(
+          res,
+          422,
+          'RECIPIENTS_REQUIRED',
+          'phones must be a non-empty array'
+        );
+
+      }
+
+
+      /*
+       * Remove duplicate numbers.
+       */
+      const unique =
+        [
+          ...new Set(
+            input.map(
+              x => {
+                try {
+                  return normalizePhone(x);
+                } catch (_) {
+                  return null;
+                }
+              }
+            ).filter(Boolean)
+          )
+        ];
+
+
+      if (
+        unique.length === 0
+      ) {
+
+        return fail(
+          res,
+          422,
+          'NO_VALID_RECIPIENTS',
+          'No valid phone numbers were supplied'
+        );
+
+      }
+
+
+      await markActive(
+        state
+      );
+
+
+      const results = [];
+
+      for (
+        const phone of unique
+      ) {
+
+        const jid =
+          jidForPhone(
+            phone
+          );
+
+
+        try {
+
+          const result =
+            await state.sock.sendMessage(
+              jid,
+              {
+                text: message
+              }
+            );
+
+
+          state.outgoingMessages += 1;
+
+
+          results.push({
+
+            phone,
+
+            success:
+              true,
+
+            jid,
+
+            message_id:
+              result?.key?.id ||
+              null
+
+          });
+
+
+          /*
+           * Small delay between messages.
+           *
+           * This is intentionally conservative
+           * to avoid hammering the connection.
+           */
+          await new Promise(
+            resolve =>
+              setTimeout(
+                resolve,
+                250
+              )
+          );
+
+
+        } catch (err) {
+
+          results.push({
+
+            phone,
+
+            success:
+              false,
+
+            error:
+              String(
+                err?.message ||
+                err
+              )
+
+          });
+
+        }
+
+      }
+
+
+      const sent =
+        results.filter(
+          x => x.success
+        ).length;
+
+      const failed =
+        results.length -
+        sent;
+
+
+      return ok(
+        res,
+        {
+
+          account,
+
+          total:
+            results.length,
+
+          sent,
+
+          failed,
+
+          results
+
+        }
+      );
+
+    }
+  )
+);
+
+
+/* ============================================================
    SEND MEDIA
-   ========================================================= */
+   ============================================================ */
 
 app.post(
   '/send-media',
@@ -1955,7 +3061,9 @@ app.post(
     async (req, res) => {
 
       const account =
-        accountIdFromRequest(req);
+        accountIdFromRequest(
+          req
+        );
 
 
       let phone;
@@ -2040,6 +3148,11 @@ app.post(
 
 
       try {
+
+        await markActive(
+          state
+        );
+
 
         const jid =
           jidForPhone(
@@ -2153,6 +3266,9 @@ app.post(
           );
 
 
+        state.outgoingMessages += 1;
+
+
         return ok(
           res,
           {
@@ -2204,9 +3320,9 @@ app.post(
 );
 
 
-/* =========================================================
+/* ============================================================
    404
-   ========================================================= */
+   ============================================================ */
 
 app.use(
   (req, res) => {
@@ -2237,9 +3353,9 @@ app.use(
 );
 
 
-/* =========================================================
-   EXPRESS ERROR HANDLER
-   ========================================================= */
+/* ============================================================
+   EXPRESS ERROR
+   ============================================================ */
 
 app.use(
   (err, req, res, next) => {
@@ -2288,27 +3404,42 @@ app.use(
 );
 
 
-/* =========================================================
-   START SERVER
-   ========================================================= */
+/* ============================================================
+   START
+   ============================================================ */
 
 const server =
   app.listen(
     PORT,
+    HOST,
     () => {
 
       logger.info(
         {
-          port: PORT,
+
+          host:
+            HOST,
+
+          port:
+            PORT,
 
           authDir:
             AUTH_DIR,
+
+          dataDir:
+            DATA_DIR,
 
           defaultCountry:
             DEFAULT_COUNTRY,
 
           qrTtlMs:
-            QR_TTL_MS
+            QR_TTL_MS,
+
+          idleTimeoutMs:
+            IDLE_TIMEOUT_MS,
+
+          autoReply:
+            AUTO_REPLY_ENABLED
 
         },
         'WhatsApp connector started'
@@ -2316,16 +3447,16 @@ const server =
 
 
       console.log(
-        `WhatsApp connector listening on port ${PORT}`
+        `WhatsApp connector listening on ${HOST}:${PORT}`
       );
 
     }
   );
 
 
-/* =========================================================
-   RESTORE EXISTING ACCOUNTS
-   ========================================================= */
+/* ============================================================
+   RESTORE ACCOUNTS
+   ============================================================ */
 
 async function restoreAccounts() {
 
@@ -2347,7 +3478,9 @@ async function restoreAccounts() {
       if (
         !entry.isDirectory()
       ) {
+
         continue;
+
       }
 
 
@@ -2358,7 +3491,9 @@ async function restoreAccounts() {
 
 
       if (!account) {
+
         continue;
+
       }
 
 
@@ -2421,9 +3556,9 @@ async function restoreAccounts() {
 restoreAccounts();
 
 
-/* =========================================================
+/* ============================================================
    GRACEFUL SHUTDOWN
-   ========================================================= */
+   ============================================================ */
 
 async function shutdown(
   signal
@@ -2458,6 +3593,11 @@ async function shutdown(
           null;
 
       }
+
+
+      clearIdleTimer(
+        state
+      );
 
 
       if (
@@ -2498,7 +3638,9 @@ async function shutdown(
 
   server.close(
     () => {
+
       process.exit(0);
+
     }
   );
 
@@ -2513,18 +3655,24 @@ async function shutdown(
 
 process.on(
   'SIGTERM',
-  () => shutdown('SIGTERM')
+  () =>
+    shutdown('SIGTERM')
 );
 
 process.on(
   'SIGINT',
-  () => shutdown('SIGINT')
+  () =>
+    shutdown('SIGINT')
 );
 
 
+/* ============================================================
+   PROCESS ERRORS
+   ============================================================ */
+
 process.on(
   'uncaughtException',
-  (err) => {
+  err => {
 
     logger.error(
       {
@@ -2543,7 +3691,7 @@ process.on(
 
 process.on(
   'unhandledRejection',
-  (err) => {
+  err => {
 
     logger.error(
       {
