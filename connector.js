@@ -1,41 +1,34 @@
 /**
  * ============================================================
- * WhatsApp Multi-Account Connector
+ * WhatsApp Multi-Account + AI Auto Reply Connector
  * ============================================================
  *
- * NO API KEY
- * NO AUTHENTICATION
- *
- * Same endpoints:
- *
- * GET  /
- * GET  /health
- * GET  /status
- * GET  /qr
- *
- * POST /connect
- * POST /pair
- * POST /disconnect
- * POST /reset
- * POST /send-message
- * POST /send-media
- *
- * NEW:
- * POST /send-to-all
- *
- * FEATURES:
- * - Multi account
+ * FEATURES
+ * - Multi WhatsApp accounts
  * - Persistent Baileys sessions
  * - QR login
  * - Pairing code
  * - Automatic reconnect
- * - Message sending
- * - Media sending
- * - Broadcast to supplied recipients
- * - First-message auto reply
- * - Persistent replied-user tracking
- * - Automatic unavailable presence after inactivity
- * - Graceful shutdown
+ * - Automatic online/available on incoming message
+ * - Welcome message
+ * - Busy message
+ * - AI auto reply
+ * - AI-only selected numbers
+ * - AI auto reply for new users
+ * - Per-number conversation memory
+ * - Multiple OpenAI API key rotation/failover
+ * - Send message
+ * - Send media
+ * - Send to all
+ *
+ * IMPORTANT:
+ * NEVER put OpenAI API keys directly in this file.
+ *
+ * Use:
+ * OPENAI_API_KEY_1
+ * OPENAI_API_KEY_2
+ * OPENAI_API_KEY_3
+ * etc.
  *
  * ============================================================
  */
@@ -69,7 +62,9 @@ const PORT =
   Number(process.env.PORT || 3000);
 
 const HOST =
-  String(process.env.HOST || '0.0.0.0');
+  String(
+    process.env.HOST || '0.0.0.0'
+  );
 
 const DEFAULT_COUNTRY =
   String(
@@ -82,57 +77,219 @@ const AUTH_DIR =
     process.env.AUTH_DIR || './auth_info'
   );
 
+const DATA_DIR =
+  path.resolve(
+    process.env.DATA_DIR || './data'
+  );
+
 const QR_TTL_MS =
   Number(
-    process.env.QR_TTL_MS ||
-    5 * 60 * 1000
+    process.env.QR_TTL_MS || 300000
   );
 
 const LOG_LEVEL =
   process.env.LOG_LEVEL || 'info';
 
+const JSON_LIMIT =
+  process.env.JSON_LIMIT || '5mb';
+
 const RECONNECT_DELAY_MS =
   Number(
-    process.env.RECONNECT_DELAY_MS ||
-    5000
+    process.env.RECONNECT_DELAY_MS || 5000
   );
 
 const MAX_RECONNECT_DELAY_MS =
   Number(
-    process.env.MAX_RECONNECT_DELAY_MS ||
-    60000
+    process.env.MAX_RECONNECT_DELAY_MS || 60000
   );
 
-const JSON_LIMIT =
-  process.env.JSON_LIMIT ||
-  '5mb';
-
-
-/*
- * How long an account can stay inactive
- * before presence becomes unavailable.
- *
- * Default: 5 minutes.
- */
 const IDLE_TIMEOUT_MS =
   Number(
-    process.env.IDLE_TIMEOUT_MS ||
-    5 * 60 * 1000
+    process.env.IDLE_TIMEOUT_MS || 300000
+  );
+
+
+/* ============================================================
+   OPENAI
+   ============================================================ */
+
+const OPENAI_ENABLED =
+  String(
+    process.env.OPENAI_ENABLED ?? 'true'
+  ).toLowerCase() !== 'false';
+
+const OPENAI_MODEL =
+  String(
+    process.env.OPENAI_MODEL || 'gpt-6-luna'
+  );
+
+const OPENAI_BASE_URL =
+  String(
+    process.env.OPENAI_BASE_URL ||
+    'https://api.openai.com/v1'
+  )
+    .replace(/\/+$/, '');
+
+const OPENAI_TIMEOUT_MS =
+  Number(
+    process.env.OPENAI_TIMEOUT_MS || 30000
+  );
+
+const AI_MAX_OUTPUT_TOKENS =
+  Number(
+    process.env.AI_MAX_OUTPUT_TOKENS || 500
+  );
+
+const AI_MAX_HISTORY =
+  Number(
+    process.env.AI_MAX_HISTORY || 12
+  );
+
+const AI_SYSTEM_PROMPT =
+  String(
+    process.env.AI_SYSTEM_PROMPT ||
+    [
+      'You are Ripun Baruah replying on WhatsApp.',
+      'Reply naturally and helpfully like a real person.',
+      'Keep replies concise unless the user asks for detail.',
+      'Do not mention that you are an AI unless the user directly asks.',
+      'Use the same language and tone as the incoming message when practical.',
+      'Do not invent personal facts about Ripun.',
+      'If you do not know something, say so briefly.'
+    ].join(' ')
   );
 
 
 /*
- * Auto reply.
+ * Multiple API keys.
+ *
+ * OPENAI_API_KEY_1
+ * OPENAI_API_KEY_2
+ * OPENAI_API_KEY_3
+ *
+ * Up to 50 supported.
  */
-const AUTO_REPLY_ENABLED =
+
+const AI_KEYS = [];
+
+for (
+  let i = 1;
+  i <= 50;
+  i += 1
+) {
+
+  const value =
+    String(
+      process.env[`OPENAI_API_KEY_${i}`] || ''
+    ).trim();
+
+  if (value) {
+    AI_KEYS.push(value);
+  }
+
+}
+
+
+/*
+ * Backward-compatible single key.
+ */
+
+if (
+  !AI_KEYS.length &&
+  process.env.OPENAI_API_KEY
+) {
+
+  AI_KEYS.push(
+    String(
+      process.env.OPENAI_API_KEY
+    ).trim()
+  );
+
+}
+
+
+let openAIKeyIndex = 0;
+
+
+/* ============================================================
+   AUTO REPLY
+   ============================================================ */
+
+const AUTO_REPLY_DEFAULT_ENABLED =
   String(
     process.env.AUTO_REPLY_ENABLED ?? 'true'
   ).toLowerCase() !== 'false';
 
-const AUTO_REPLY_TEXT =
+const AUTO_AI_NEW_USERS =
   String(
-    process.env.AUTO_REPLY_TEXT ||
-    "Thanks for your message! 💬\n\nRipun is currently offline. He’ll reply as soon as possible. 😊"
+    process.env.AUTO_AI_NEW_USERS ?? 'true'
+  ).toLowerCase() !== 'false';
+
+
+const ENV_AI_ONLY_NUMBERS =
+  String(
+    process.env.AI_ONLY_NUMBERS || ''
+  )
+    .split(',')
+    .map(
+      x => x.trim()
+    )
+    .filter(Boolean);
+
+
+const DEFAULT_WELCOME_TEXT =
+  String(
+    process.env.WELCOME_TEXT ||
+    'Hi! 👋 Thanks for messaging Ripun Baruah. I’ll get back to you soon.'
+  );
+
+
+const DEFAULT_BUSY_TEXT =
+  String(
+    process.env.BUSY_TEXT ||
+    'Hi! I’m currently busy. Please leave your message and I’ll get back to you as soon as possible. 😊'
+  );
+
+
+const WELCOME_DEFAULT_ENABLED =
+  String(
+    process.env.WELCOME_ENABLED ?? 'true'
+  ).toLowerCase() !== 'false';
+
+
+const BUSY_DEFAULT_ENABLED =
+  String(
+    process.env.BUSY_ENABLED ?? 'false'
+  ).toLowerCase() === 'true';
+
+
+const BUSY_MODE =
+  String(
+    process.env.BUSY_MODE || 'before_ai'
+  ).toLowerCase();
+
+
+const REPLY_TO_MEDIA =
+  String(
+    process.env.REPLY_TO_MEDIA ?? 'false'
+  ).toLowerCase() === 'true';
+
+
+const TYPING_BEFORE_AI =
+  String(
+    process.env.TYPING_BEFORE_AI ?? 'true'
+  ).toLowerCase() !== 'false';
+
+
+const TYPING_MIN_MS =
+  Number(
+    process.env.TYPING_MIN_MS || 400
+  );
+
+
+const TYPING_MAX_MS =
+  Number(
+    process.env.TYPING_MAX_MS || 1400
   );
 
 
@@ -153,29 +310,37 @@ const logger =
    EXPRESS
    ============================================================ */
 
-app.disable('x-powered-by');
+app.disable(
+  'x-powered-by'
+);
+
 
 app.use(
   cors({
     origin: true,
+
     methods: [
       'GET',
       'POST',
       'OPTIONS'
     ],
+
     allowedHeaders: [
       'Content-Type',
       'X-Account-ID',
       'X-Connection-ID'
     ]
+
   })
 );
+
 
 app.use(
   express.json({
     limit: JSON_LIMIT
   })
 );
+
 
 app.use(
   express.urlencoded({
@@ -197,23 +362,6 @@ fs.mkdirSync(
 );
 
 
-/*
- * Separate data directory.
- *
- * This stores:
- *
- * data/
- *   user1/
- *      replied.json
- *
- * This allows first-message tracking
- * to survive restarts.
- */
-const DATA_DIR =
-  path.resolve(
-    process.env.DATA_DIR || './data'
-  );
-
 fs.mkdirSync(
   DATA_DIR,
   {
@@ -231,17 +379,23 @@ const accounts =
 
 
 /* ============================================================
-   HELPERS
+   ACCOUNT HELPERS
    ============================================================ */
 
-function cleanAccountId(value) {
+function cleanAccountId(
+  value
+) {
 
   const id =
-    String(value || '').trim();
+    String(
+      value || ''
+    ).trim();
+
 
   if (!id) {
     return 'user1';
   }
+
 
   const safe =
     id
@@ -249,28 +403,45 @@ function cleanAccountId(value) {
         /[^a-zA-Z0-9_-]/g,
         ''
       )
-      .slice(0, 64);
+      .slice(
+        0,
+        64
+      );
+
 
   return safe || 'user1';
+
 }
 
 
-function accountIdFromRequest(req) {
+function accountIdFromRequest(
+  req
+) {
 
   return cleanAccountId(
+
     req.body?.account ||
+
     req.body?.account_id ||
+
     req.query?.account ||
+
     req.query?.account_id ||
+
     req.headers['x-account-id'] ||
+
     req.headers['x-connection-id'] ||
+
     'user1'
+
   );
 
 }
 
 
-function authPath(account) {
+function authPath(
+  account
+) {
 
   return path.join(
     AUTH_DIR,
@@ -280,13 +451,16 @@ function authPath(account) {
 }
 
 
-function dataPath(account) {
+function dataPath(
+  account
+) {
 
   const dir =
     path.join(
       DATA_DIR,
       account
     );
+
 
   fs.mkdirSync(
     dir,
@@ -295,66 +469,562 @@ function dataPath(account) {
     }
   );
 
+
   return dir;
+
 }
 
 
-function repliedPath(account) {
+function autoReplyPath(
+  account
+) {
 
   return path.join(
     dataPath(account),
-    'replied.json'
+    'auto-reply.json'
   );
 
 }
 
 
-function createAccountState(account) {
+function historyPath(
+  account
+) {
 
-  if (!accounts.has(account)) {
+  return path.join(
+    dataPath(account),
+    'ai-history.json'
+  );
+
+}
+
+
+/* ============================================================
+   JSON STORAGE
+   ============================================================ */
+
+function safeReadJson(
+  file,
+  fallback
+) {
+
+  try {
+
+    if (
+      !fs.existsSync(file)
+    ) {
+
+      return fallback;
+
+    }
+
+
+    const parsed =
+      JSON.parse(
+        fs.readFileSync(
+          file,
+          'utf8'
+        )
+      );
+
+
+    return (
+      parsed &&
+      typeof parsed === 'object'
+    )
+      ? parsed
+      : fallback;
+
+
+  } catch (err) {
+
+    logger.warn(
+      {
+        file,
+        err: String(err)
+      },
+      'JSON read failed'
+    );
+
+
+    return fallback;
+
+  }
+
+}
+
+
+function safeWriteJson(
+  file,
+  value
+) {
+
+  const tmp =
+    `${file}.tmp`;
+
+
+  fs.writeFileSync(
+    tmp,
+    JSON.stringify(
+      value,
+      null,
+      2
+    ),
+    'utf8'
+  );
+
+
+  fs.renameSync(
+    tmp,
+    file
+  );
+
+}
+
+
+/* ============================================================
+   PHONE
+   ============================================================ */
+
+function normalizePhone(
+  input
+) {
+
+  let value =
+    String(
+      input || ''
+    ).trim();
+
+
+  if (!value) {
+
+    throw new Error(
+      'Phone number is required'
+    );
+
+  }
+
+
+  value =
+    value.replace(
+      /[^\d+]/g,
+      ''
+    );
+
+
+  if (
+    value.startsWith('+')
+  ) {
+
+    value =
+      value.slice(1);
+
+  }
+
+
+  if (
+    value.startsWith('00')
+  ) {
+
+    value =
+      value.slice(2);
+
+  }
+
+
+  let digits =
+    value.replace(
+      /\D/g,
+      ''
+    );
+
+
+  if (!digits) {
+
+    throw new Error(
+      'Invalid phone number'
+    );
+
+  }
+
+
+  if (
+    digits.length <= 10
+  ) {
+
+    digits =
+      DEFAULT_COUNTRY +
+      digits.replace(
+        /^0+/,
+        ''
+      );
+
+  }
+
+
+  return digits;
+
+}
+
+
+function jidForPhone(
+  phone
+) {
+
+  return (
+    normalizePhone(phone) +
+    '@s.whatsapp.net'
+  );
+
+}
+
+
+function extractPhoneFromJid(
+  jid
+) {
+
+  if (!jid) {
+    return null;
+  }
+
+
+  return (
+    String(jid)
+      .split(':')[0]
+      .split('@')[0] ||
+    null
+  );
+
+}
+
+
+function isGroupJid(
+  jid
+) {
+
+  return String(
+    jid || ''
+  ).endsWith(
+    '@g.us'
+  );
+
+}
+
+
+function isBroadcastJid(
+  jid
+) {
+
+  return (
+    String(jid || '') ===
+    'status@broadcast'
+  );
+
+}
+
+
+/* ============================================================
+   AUTO REPLY CONFIG
+   ============================================================ */
+
+function defaultAutoReplyConfig() {
+
+  return {
+
+    enabled:
+      AUTO_REPLY_DEFAULT_ENABLED,
+
+    ai_enabled:
+      OPENAI_ENABLED,
+
+    ai_new_users:
+      AUTO_AI_NEW_USERS,
+
+    ai_only_numbers:
+      ENV_AI_ONLY_NUMBERS
+        .map(
+          x => {
+
+            try {
+
+              return normalizePhone(x);
+
+            } catch (_) {
+
+              return null;
+
+            }
+
+          }
+        )
+        .filter(Boolean),
+
+    welcome_enabled:
+      WELCOME_DEFAULT_ENABLED,
+
+    welcome_text:
+      DEFAULT_WELCOME_TEXT,
+
+    busy_enabled:
+      BUSY_DEFAULT_ENABLED,
+
+    busy_text:
+      DEFAULT_BUSY_TEXT,
+
+    busy_mode:
+      BUSY_MODE,
+
+    ai_all_messages:
+      true,
+
+    reply_to_media:
+      REPLY_TO_MEDIA,
+
+    system_prompt:
+      AI_SYSTEM_PROMPT,
+
+    max_history:
+      AI_MAX_HISTORY
+
+  };
+
+}
+
+
+function normalizeConfig(
+  account
+) {
+
+  const current =
+    safeReadJson(
+      autoReplyPath(account),
+      defaultAutoReplyConfig()
+    );
+
+
+  const defaults =
+    defaultAutoReplyConfig();
+
+
+  const cfg = {
+    ...defaults,
+    ...current
+  };
+
+
+  if (
+    !Array.isArray(
+      cfg.ai_only_numbers
+    )
+  ) {
+
+    cfg.ai_only_numbers = [];
+
+  }
+
+
+  cfg.ai_only_numbers =
+    [
+      ...new Set(
+
+        cfg.ai_only_numbers
+          .map(
+            x => {
+
+              try {
+
+                return normalizePhone(x);
+
+              } catch (_) {
+
+                return null;
+
+              }
+
+            }
+          )
+          .filter(Boolean)
+
+      )
+    ];
+
+
+  if (
+    !Number.isFinite(
+      Number(
+        cfg.max_history
+      )
+    )
+  ) {
+
+    cfg.max_history =
+      AI_MAX_HISTORY;
+
+  }
+
+
+  return cfg;
+
+}
+
+
+function saveConfig(
+  account,
+  cfg
+) {
+
+  const normalized = {
+
+    ...defaultAutoReplyConfig(),
+
+    ...cfg,
+
+    ai_only_numbers:
+      [
+        ...new Set(
+
+          (
+            Array.isArray(
+              cfg.ai_only_numbers
+            )
+              ? cfg.ai_only_numbers
+              : []
+          )
+            .map(
+              x => {
+
+                try {
+
+                  return normalizePhone(x);
+
+                } catch (_) {
+
+                  return null;
+
+                }
+
+              }
+            )
+            .filter(Boolean)
+
+        )
+      ]
+
+  };
+
+
+  safeWriteJson(
+    autoReplyPath(account),
+    normalized
+  );
+
+
+  return normalized;
+
+}
+
+
+/* ============================================================
+   AI HISTORY
+   ============================================================ */
+
+function loadHistory(
+  account
+) {
+
+  return safeReadJson(
+    historyPath(account),
+    {}
+  );
+
+}
+
+
+function saveHistory(
+  account,
+  history
+) {
+
+  safeWriteJson(
+    historyPath(account),
+    history
+  );
+
+}
+
+
+/* ============================================================
+   ACCOUNT STATE
+   ============================================================ */
+
+function createAccountState(
+  account
+) {
+
+  if (
+    !accounts.has(account)
+  ) {
 
     accounts.set(
       account,
       {
 
-        id: account,
+        id:
+          account,
 
-        sock: null,
+        sock:
+          null,
 
-        connecting: false,
+        connecting:
+          false,
 
-        connected: false,
+        connected:
+          false,
 
-        status: 'disconnected',
+        status:
+          'disconnected',
 
-        phone: null,
+        phone:
+          null,
 
-        jid: null,
+        jid:
+          null,
 
-        qr: null,
+        qr:
+          null,
 
-        qrImage: null,
+        qrImage:
+          null,
 
-        qrCreatedAt: null,
+        qrCreatedAt:
+          null,
 
-        qrExpiresAt: null,
+        qrExpiresAt:
+          null,
 
-        pairingCode: null,
+        pairingCode:
+          null,
 
-        pairingCreatedAt: null,
+        pairingCreatedAt:
+          null,
 
-        connectedAt: null,
+        connectedAt:
+          null,
 
-        lastDisconnect: null,
+        lastDisconnect:
+          null,
 
-        lastError: null,
+        lastError:
+          null,
 
-        reconnectTimer: null,
+        reconnectTimer:
+          null,
 
         reconnectDelay:
           RECONNECT_DELAY_MS,
 
-        generation: 0,
+        generation:
+          0,
 
         lastActivity:
           null,
@@ -375,6 +1045,12 @@ function createAccountState(account) {
           0,
 
         autoReplies:
+          0,
+
+        aiReplies:
+          0,
+
+        aiErrors:
           0
 
       }
@@ -382,115 +1058,56 @@ function createAccountState(account) {
 
   }
 
-  return accounts.get(account);
-}
 
-
-/* ============================================================
-   REPLIED USER STORAGE
-   ============================================================ */
-
-function loadRepliedUsers(account) {
-
-  const file =
-    repliedPath(account);
-
-  try {
-
-    if (
-      !fs.existsSync(file)
-    ) {
-
-      return {};
-
-    }
-
-    const raw =
-      fs.readFileSync(
-        file,
-        'utf8'
-      );
-
-    const parsed =
-      JSON.parse(raw);
-
-    if (
-      parsed &&
-      typeof parsed === 'object'
-    ) {
-
-      return parsed;
-
-    }
-
-  } catch (err) {
-
-    logger.warn(
-      {
-        account,
-        err: String(err)
-      },
-      'Could not load replied users'
-    );
-
-  }
-
-  return {};
-}
-
-
-function saveRepliedUsers(state) {
-
-  try {
-
-    fs.writeFileSync(
-      repliedPath(state.id),
-      JSON.stringify(
-        state.repliedUsers,
-        null,
-        2
-      ),
-      'utf8'
-    );
-
-  } catch (err) {
-
-    logger.error(
-      {
-        account: state.id,
-        err: String(err)
-      },
-      'Could not save replied users'
-    );
-
-  }
-
-}
-
-
-function hasReceivedAutoReply(
-  state,
-  phone
-) {
-
-  return Boolean(
-    state.repliedUsers[phone]
+  return accounts.get(
+    account
   );
 
 }
 
 
-function markAutoReplySent(
+/* ============================================================
+   REPLIED USERS
+   ============================================================ */
+
+function loadRepliedUsers(
+  account
+) {
+
+  return safeReadJson(
+    path.join(
+      dataPath(account),
+      'replied-users.json'
+    ),
+    {}
+  );
+
+}
+
+
+function markFirstReplySent(
   state,
   phone
 ) {
 
-  state.repliedUsers[phone] = {
+  state.repliedUsers[
+    phone
+  ] = {
+
     replied_at:
-      new Date().toISOString()
+      new Date()
+        .toISOString()
+
   };
 
-  saveRepliedUsers(state);
+
+  safeWriteJson(
+    path.join(
+      dataPath(state.id),
+      'replied-users.json'
+    ),
+    state.repliedUsers
+  );
 
 }
 
@@ -499,145 +1116,65 @@ function markAutoReplySent(
    QR
    ============================================================ */
 
-function clearQR(state) {
+function clearQR(
+  state
+) {
 
-  state.qr = null;
+  state.qr =
+    null;
 
-  state.qrImage = null;
+  state.qrImage =
+    null;
 
-  state.qrCreatedAt = null;
+  state.qrCreatedAt =
+    null;
 
-  state.qrExpiresAt = null;
-
-}
-
-
-function clearPairing(state) {
-
-  state.pairingCode = null;
-
-  state.pairingCreatedAt = null;
+  state.qrExpiresAt =
+    null;
 
 }
 
 
-function qrIsValid(state) {
+function clearPairing(
+  state
+) {
+
+  state.pairingCode =
+    null;
+
+  state.pairingCreatedAt =
+    null;
+
+}
+
+
+function qrIsValid(
+  state
+) {
 
   return Boolean(
+
     state.qr &&
+
     state.qrImage &&
+
     state.qrExpiresAt &&
+
     Date.now() <
       state.qrExpiresAt
+
   );
 
 }
 
 
 /* ============================================================
-   PHONE
+   PRESENCE
    ============================================================ */
 
-function normalizePhone(input) {
-
-  let value =
-    String(input || '').trim();
-
-  if (!value) {
-
-    throw new Error(
-      'Phone number is required'
-    );
-
-  }
-
-  value =
-    value.replace(
-      /[^\d+]/g,
-      ''
-    );
-
-  if (
-    value.startsWith('+')
-  ) {
-
-    value =
-      value.slice(1);
-
-  }
-
-  if (
-    value.startsWith('00')
-  ) {
-
-    value =
-      value.slice(2);
-
-  }
-
-  let digits =
-    value.replace(
-      /\D/g,
-      ''
-    );
-
-  if (!digits) {
-
-    throw new Error(
-      'Invalid phone number'
-    );
-
-  }
-
-  if (
-    digits.length <= 10
-  ) {
-
-    digits =
-      DEFAULT_COUNTRY +
-      digits.replace(
-        /^0+/,
-        ''
-      );
-
-  }
-
-  return digits;
-
-}
-
-
-function jidForPhone(phone) {
-
-  return (
-    normalizePhone(phone) +
-    '@s.whatsapp.net'
-  );
-
-}
-
-
-function extractPhoneFromJid(jid) {
-
-  if (!jid) {
-    return null;
-  }
-
-  return (
-    String(jid)
-      .split(':')[0]
-      .split('@')[0] ||
-    null
-  );
-
-}
-
-
-/* ============================================================
-   PRESENCE / ONLINE STATUS
-   ============================================================ */
-
-function clearIdleTimer(state) {
+function clearIdleTimer(
+  state
+) {
 
   if (
     state.idleTimer
@@ -655,7 +1192,9 @@ function clearIdleTimer(state) {
 }
 
 
-async function setUnavailable(state) {
+async function setAvailable(
+  state
+) {
 
   if (
     !state.sock ||
@@ -666,31 +1205,31 @@ async function setUnavailable(state) {
 
   }
 
+
   try {
 
     await state.sock
       .sendPresenceUpdate(
-        'unavailable'
+        'available'
       );
 
-    state.isAvailable =
-      false;
 
-    logger.debug(
-      {
-        account: state.id
-      },
-      'Account marked unavailable'
-    );
+    state.isAvailable =
+      true;
+
 
   } catch (err) {
 
     logger.debug(
       {
-        account: state.id,
-        err: String(err)
+        account:
+          state.id,
+
+        err:
+          String(err)
+
       },
-      'Could not update unavailable presence'
+      'Could not set available presence'
     );
 
   }
@@ -698,9 +1237,59 @@ async function setUnavailable(state) {
 }
 
 
-function scheduleIdlePresence(state) {
+async function setUnavailable(
+  state
+) {
 
-  clearIdleTimer(state);
+  if (
+    !state.sock ||
+    !state.connected
+  ) {
+
+    return;
+
+  }
+
+
+  try {
+
+    await state.sock
+      .sendPresenceUpdate(
+        'unavailable'
+      );
+
+
+    state.isAvailable =
+      false;
+
+
+  } catch (err) {
+
+    logger.debug(
+      {
+        account:
+          state.id,
+
+        err:
+          String(err)
+
+      },
+      'Could not set unavailable presence'
+    );
+
+  }
+
+}
+
+
+function scheduleIdlePresence(
+  state
+) {
+
+  clearIdleTimer(
+    state
+  );
+
 
   state.idleTimer =
     setTimeout(
@@ -708,6 +1297,7 @@ function scheduleIdlePresence(state) {
 
         state.idleTimer =
           null;
+
 
         await setUnavailable(
           state
@@ -720,29 +1310,18 @@ function scheduleIdlePresence(state) {
 }
 
 
-async function markActive(state) {
+async function markActive(
+  state
+) {
 
   state.lastActivity =
     Date.now();
 
-  if (
-    state.sock &&
-    state.connected
-  ) {
 
-    try {
+  await setAvailable(
+    state
+  );
 
-      await state.sock
-        .sendPresenceUpdate(
-          'available'
-        );
-
-      state.isAvailable =
-        true;
-
-    } catch (_) {}
-
-  }
 
   scheduleIdlePresence(
     state
@@ -752,14 +1331,1307 @@ async function markActive(state) {
 
 
 /* ============================================================
-   STATUS
+   MESSAGE EXTRACTION
    ============================================================ */
 
-function getStatus(state) {
+function getMessageText(
+  message
+) {
+
+  const m =
+    message?.message;
+
+
+  if (!m) {
+    return '';
+  }
+
+
+  return (
+
+    m.conversation ||
+
+    m.extendedTextMessage?.text ||
+
+    m.imageMessage?.caption ||
+
+    m.videoMessage?.caption ||
+
+    m.documentMessage?.caption ||
+
+    m.buttonsResponseMessage
+      ?.selectedDisplayText ||
+
+    m.listResponseMessage
+      ?.title ||
+
+    m.templateButtonReplyMessage
+      ?.selectedDisplayText ||
+
+    m.interactiveResponseMessage
+      ?.body?.text ||
+
+    ''
+
+  ).trim();
+
+}
+
+
+/* ============================================================
+   AUTO REPLY STATE
+   ============================================================ */
+
+function getAutoReplyState(
+  account,
+  phone
+) {
+
+  const cfg =
+    normalizeConfig(
+      account
+    );
+
+
+  const isAiOnly =
+    cfg.ai_only_numbers
+      .includes(phone);
+
+
+  const state =
+    createAccountState(
+      account
+    );
+
+
+  const isNewUser =
+    !state.repliedUsers[
+      phone
+    ];
+
 
   return {
 
-    success: true,
+    cfg,
+
+    isAiOnly,
+
+    isNewUser
+
+  };
+
+}
+
+
+/* ============================================================
+   GENERAL HELPERS
+   ============================================================ */
+
+function sleep(
+  ms
+) {
+
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+
+}
+
+
+function randomBetween(
+  min,
+  max
+) {
+
+  const a =
+    Math.max(
+      0,
+      Number(min) || 0
+    );
+
+
+  const b =
+    Math.max(
+      a,
+      Number(max) || a
+    );
+
+
+  return Math.floor(
+    a +
+    Math.random() *
+      (b - a + 1)
+  );
+
+}
+
+
+/* ============================================================
+   TYPING
+   ============================================================ */
+
+async function maybeTyping(
+  state,
+  jid
+) {
+
+  if (
+    !TYPING_BEFORE_AI ||
+    !state.sock ||
+    !state.connected
+  ) {
+
+    return;
+
+  }
+
+
+  try {
+
+    await state.sock
+      .sendPresenceUpdate(
+        'composing',
+        jid
+      );
+
+
+    await sleep(
+      randomBetween(
+        TYPING_MIN_MS,
+        TYPING_MAX_MS
+      )
+    );
+
+
+    await state.sock
+      .sendPresenceUpdate(
+        'paused',
+        jid
+      );
+
+
+  } catch (_) {}
+
+}
+
+
+/* ============================================================
+   OPENAI KEY ROTATION
+   ============================================================ */
+
+function getNextOpenAIKey() {
+
+  if (
+    !AI_KEYS.length
+  ) {
+
+    return null;
+
+  }
+
+
+  const key =
+    AI_KEYS[
+      openAIKeyIndex %
+      AI_KEYS.length
+    ];
+
+
+  openAIKeyIndex =
+    (
+      openAIKeyIndex + 1
+    ) %
+    AI_KEYS.length;
+
+
+  return key;
+
+}
+
+
+function isRetryableOpenAIStatus(
+  status
+) {
+
+  return (
+
+    status === 401 ||
+
+    status === 408 ||
+
+    status === 409 ||
+
+    status === 429 ||
+
+    status >= 500
+
+  );
+
+}
+
+
+/* ============================================================
+   OPENAI REQUEST
+   ============================================================ */
+
+async function openAIRequest(
+  body,
+  key
+) {
+
+  const controller =
+    new AbortController();
+
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      OPENAI_TIMEOUT_MS
+    );
+
+
+  try {
+
+    const response =
+      await fetch(
+
+        `${OPENAI_BASE_URL}/responses`,
+
+        {
+
+          method:
+            'POST',
+
+          headers: {
+
+            'Content-Type':
+              'application/json',
+
+            Authorization:
+              `Bearer ${key}`
+
+          },
+
+          body:
+            JSON.stringify(
+              body
+            ),
+
+          signal:
+            controller.signal
+
+        }
+
+      );
+
+
+    const raw =
+      await response.text();
+
+
+    let json;
+
+
+    try {
+
+      json =
+        JSON.parse(
+          raw
+        );
+
+    } catch (_) {
+
+      json = {
+        raw
+      };
+
+    }
+
+
+    if (
+      !response.ok
+    ) {
+
+      const error =
+        new Error(
+
+          json?.error?.message ||
+
+          json?.message ||
+
+          `OpenAI HTTP ${response.status}`
+
+        );
+
+
+      error.status =
+        response.status;
+
+
+      error.openai =
+        json;
+
+
+      throw error;
+
+    }
+
+
+    return json;
+
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
+/* ============================================================
+   OPENAI OUTPUT
+   ============================================================ */
+
+function extractOpenAIText(
+  response
+) {
+
+  if (
+    typeof response?.output_text ===
+    'string'
+  ) {
+
+    return response
+      .output_text
+      .trim();
+
+  }
+
+
+  const chunks =
+    [];
+
+
+  for (
+    const item of
+    response?.output || []
+  ) {
+
+    for (
+      const content of
+      item?.content || []
+    ) {
+
+      if (
+        typeof content?.text ===
+        'string'
+      ) {
+
+        chunks.push(
+          content.text
+        );
+
+      }
+
+    }
+
+  }
+
+
+  return chunks
+    .join('\n')
+    .trim();
+
+}
+
+
+/* ============================================================
+   GENERATE AI REPLY
+   ============================================================ */
+
+async function generateAIReply({
+
+  account,
+
+  phone,
+
+  userText,
+
+  cfg
+
+}) {
+
+  if (
+    !OPENAI_ENABLED ||
+    !cfg.ai_enabled
+  ) {
+
+    throw new Error(
+      'AI auto reply is disabled'
+    );
+
+  }
+
+
+  if (
+    !AI_KEYS.length
+  ) {
+
+    throw new Error(
+      'No OpenAI API key configured. Set OPENAI_API_KEY_1, OPENAI_API_KEY_2, etc.'
+    );
+
+  }
+
+
+  const history =
+    loadHistory(
+      account
+    );
+
+
+  const conversation =
+    Array.isArray(
+      history[phone]
+    )
+      ? history[phone]
+      : [];
+
+
+  const maxHistory =
+    Math.max(
+      2,
+      Math.min(
+        50,
+        Number(
+          cfg.max_history
+        ) ||
+        AI_MAX_HISTORY
+      )
+    );
+
+
+  const recent =
+    conversation.slice(
+      -maxHistory
+    );
+
+
+  const body = {
+
+    model:
+      OPENAI_MODEL,
+
+    instructions:
+      String(
+        cfg.system_prompt ||
+        AI_SYSTEM_PROMPT
+      ),
+
+    input:
+
+      [
+
+        ...recent.map(
+          item => ({
+
+            role:
+              item.role,
+
+            content:
+              item.text
+
+          })
+        ),
+
+        {
+
+          role:
+            'user',
+
+          content:
+            userText
+
+        }
+
+      ],
+
+    max_output_tokens:
+      AI_MAX_OUTPUT_TOKENS
+
+  };
+
+
+  let lastError =
+    null;
+
+
+  for (
+    let attempt = 0;
+    attempt < AI_KEYS.length;
+    attempt += 1
+  ) {
+
+    const key =
+      getNextOpenAIKey();
+
+
+    try {
+
+      const response =
+        await openAIRequest(
+          body,
+          key
+        );
+
+
+      const answer =
+        extractOpenAIText(
+          response
+        );
+
+
+      if (!answer) {
+
+        throw new Error(
+          'OpenAI returned an empty response'
+        );
+
+      }
+
+
+      const nextHistory =
+
+        [
+
+          ...recent,
+
+          {
+            role:
+              'user',
+
+            text:
+              userText
+          },
+
+          {
+            role:
+              'assistant',
+
+            text:
+              answer
+          }
+
+        ]
+          .slice(
+            -maxHistory
+          );
+
+
+      history[phone] =
+        nextHistory;
+
+
+      saveHistory(
+        account,
+        history
+      );
+
+
+      return answer;
+
+
+    } catch (err) {
+
+      lastError =
+        err;
+
+
+      logger.warn(
+        {
+
+          account,
+
+          phone,
+
+          status:
+            err?.status ||
+            null,
+
+          key_slot:
+            (
+              (
+                openAIKeyIndex -
+                1 +
+                AI_KEYS.length
+              ) %
+              AI_KEYS.length
+            ) + 1,
+
+          err:
+            String(
+              err?.message ||
+              err
+            )
+
+        },
+
+        'OpenAI request failed'
+      );
+
+
+      if (
+        !isRetryableOpenAIStatus(
+          err?.status
+        )
+      ) {
+
+        break;
+
+      }
+
+    }
+
+  }
+
+
+  throw (
+    lastError ||
+    new Error(
+      'OpenAI request failed'
+    )
+  );
+
+}
+
+
+/* ============================================================
+   SEND TEXT
+   ============================================================ */
+
+async function sendText(
+  state,
+  phone,
+  text
+) {
+
+  const jid =
+    jidForPhone(
+      phone
+    );
+
+
+  await state.sock
+    .sendMessage(
+      jid,
+      {
+        text
+      }
+    );
+
+
+  state.outgoingMessages +=
+    1;
+
+
+  return jid;
+
+}
+
+
+/* ============================================================
+   INCOMING MESSAGE
+   ============================================================ */
+
+async function processIncomingMessage(
+  state,
+  message
+) {
+
+  try {
+
+    if (
+      !state.connected ||
+      !state.sock
+    ) {
+
+      return;
+
+    }
+
+
+    if (
+      !message ||
+      message.key?.fromMe
+    ) {
+
+      return;
+
+    }
+
+
+    const remoteJid =
+      message.key?.remoteJid;
+
+
+    if (!remoteJid) {
+      return;
+    }
+
+
+    if (
+      isGroupJid(
+        remoteJid
+      )
+    ) {
+
+      return;
+
+    }
+
+
+    if (
+      isBroadcastJid(
+        remoteJid
+      )
+    ) {
+
+      return;
+
+    }
+
+
+    const phone =
+      extractPhoneFromJid(
+        remoteJid
+      );
+
+
+    if (!phone) {
+      return;
+    }
+
+
+    state.incomingMessages +=
+      1;
+
+
+    /*
+     * IMPORTANT:
+     *
+     * As soon as a message arrives,
+     * make WhatsApp account available/online.
+     */
+
+    await markActive(
+      state
+    );
+
+
+    const {
+
+      cfg,
+
+      isAiOnly,
+
+      isNewUser
+
+    } =
+      getAutoReplyState(
+        state.id,
+        phone
+      );
+
+
+    if (
+      !cfg.enabled
+    ) {
+
+      return;
+
+    }
+
+
+    const text =
+      getMessageText(
+        message
+      );
+
+
+    const hasText =
+      Boolean(
+        text
+      );
+
+
+    if (
+      !hasText &&
+      !cfg.reply_to_media
+    ) {
+
+      return;
+
+    }
+
+
+    /* ========================================================
+       AI ONLY NUMBER
+       ======================================================== */
+
+    if (
+      isAiOnly
+    ) {
+
+      if (!hasText) {
+        return;
+      }
+
+
+      try {
+
+        await maybeTyping(
+          state,
+          remoteJid
+        );
+
+
+        const answer =
+          await generateAIReply({
+
+            account:
+              state.id,
+
+            phone,
+
+            userText:
+              text,
+
+            cfg
+
+          });
+
+
+        await sendText(
+          state,
+          phone,
+          answer
+        );
+
+
+        state.autoReplies +=
+          1;
+
+
+        state.aiReplies +=
+          1;
+
+
+        markFirstReplySent(
+          state,
+          phone
+        );
+
+
+        logger.info(
+          {
+            account:
+              state.id,
+
+            phone
+          },
+          'AI-only reply sent'
+        );
+
+
+      } catch (err) {
+
+        state.aiErrors +=
+          1;
+
+
+        state.lastError =
+          String(
+            err?.message ||
+            err
+          );
+
+
+        logger.error(
+          {
+
+            account:
+              state.id,
+
+            phone,
+
+            err:
+              String(
+                err?.message ||
+                err
+              )
+
+          },
+
+          'AI-only reply failed'
+        );
+
+      }
+
+
+      return;
+
+    }
+
+
+    /* ========================================================
+       NEW USER WELCOME
+       ======================================================== */
+
+    if (
+      isNewUser &&
+      cfg.welcome_enabled
+    ) {
+
+      try {
+
+        await sendText(
+          state,
+          phone,
+          String(
+            cfg.welcome_text ||
+            DEFAULT_WELCOME_TEXT
+          )
+        );
+
+
+        state.autoReplies +=
+          1;
+
+
+      } catch (err) {
+
+        logger.warn(
+          {
+
+            account:
+              state.id,
+
+            phone,
+
+            err:
+              String(err)
+
+          },
+
+          'Welcome message failed'
+        );
+
+      }
+
+    }
+
+
+    /* ========================================================
+       BUSY INSTEAD OF AI
+       ======================================================== */
+
+    if (
+
+      cfg.busy_enabled &&
+
+      String(
+        cfg.busy_mode
+      ).toLowerCase() ===
+      'instead'
+
+    ) {
+
+      try {
+
+        await sendText(
+          state,
+          phone,
+          String(
+            cfg.busy_text ||
+            DEFAULT_BUSY_TEXT
+          )
+        );
+
+
+        state.autoReplies +=
+          1;
+
+
+        markFirstReplySent(
+          state,
+          phone
+        );
+
+
+      } catch (err) {
+
+        logger.warn(
+          {
+
+            account:
+              state.id,
+
+            phone,
+
+            err:
+              String(err)
+
+          },
+
+          'Busy message failed'
+        );
+
+      }
+
+
+      return;
+
+    }
+
+
+    /* ========================================================
+       BUSY + AI
+       ======================================================== */
+
+    if (
+      cfg.busy_enabled
+    ) {
+
+      try {
+
+        await sendText(
+          state,
+          phone,
+          String(
+            cfg.busy_text ||
+            DEFAULT_BUSY_TEXT
+          )
+        );
+
+
+        state.autoReplies +=
+          1;
+
+
+      } catch (err) {
+
+        logger.warn(
+          {
+
+            account:
+              state.id,
+
+            phone,
+
+            err:
+              String(err)
+
+          },
+
+          'Busy message failed'
+        );
+
+      }
+
+    }
+
+
+    /* ========================================================
+       AI
+       ======================================================== */
+
+    const shouldAI =
+
+      cfg.ai_enabled &&
+
+      cfg.ai_all_messages &&
+
+      (
+        hasText ||
+        cfg.reply_to_media
+      ) &&
+
+      (
+        cfg.ai_new_users ||
+        !isNewUser
+      );
+
+
+    if (
+      !shouldAI
+    ) {
+
+      if (
+        isNewUser
+      ) {
+
+        markFirstReplySent(
+          state,
+          phone
+        );
+
+      }
+
+
+      return;
+
+    }
+
+
+    if (!hasText) {
+      return;
+    }
+
+
+    try {
+
+      await maybeTyping(
+        state,
+        remoteJid
+      );
+
+
+      const answer =
+        await generateAIReply({
+
+          account:
+            state.id,
+
+          phone,
+
+          userText:
+            text,
+
+          cfg
+
+        });
+
+
+      await sendText(
+        state,
+        phone,
+        answer
+      );
+
+
+      state.autoReplies +=
+        1;
+
+
+      state.aiReplies +=
+        1;
+
+
+      markFirstReplySent(
+        state,
+        phone
+      );
+
+
+      logger.info(
+        {
+
+          account:
+            state.id,
+
+          phone
+
+        },
+
+        'AI auto reply sent'
+      );
+
+
+    } catch (err) {
+
+      state.aiErrors +=
+        1;
+
+
+      state.lastError =
+        String(
+          err?.message ||
+          err
+        );
+
+
+      logger.error(
+        {
+
+          account:
+            state.id,
+
+          phone,
+
+          err:
+            String(
+              err?.message ||
+              err
+            )
+
+        },
+
+        'AI auto reply failed'
+      );
+
+    }
+
+
+  } catch (err) {
+
+    logger.error(
+      {
+
+        account:
+          state.id,
+
+        err:
+          String(
+            err?.stack ||
+            err
+          )
+
+      },
+
+      'Incoming message processing failed'
+    );
+
+  }
+
+}
+
+
+/* ============================================================
+   STATUS
+   ============================================================ */
+
+function getStatus(
+  state
+) {
+
+  const cfg =
+    normalizeConfig(
+      state.id
+    );
+
+
+  return {
+
+    success:
+      true,
 
     account:
       state.id,
@@ -780,7 +2652,9 @@ function getStatus(state) {
       state.jid,
 
     qr_available:
-      qrIsValid(state),
+      qrIsValid(
+        state
+      ),
 
     qr_created_at:
       state.qrCreatedAt
@@ -829,10 +2703,19 @@ function getStatus(state) {
     auto_replies:
       state.autoReplies,
 
+    ai_replies:
+      state.aiReplies,
+
+    ai_errors:
+      state.aiErrors,
+
     remembered_recipients:
       Object.keys(
         state.repliedUsers
       ).length,
+
+    ai_only_numbers:
+      cfg.ai_only_numbers,
 
     last_disconnect:
       state.lastDisconnect,
@@ -846,171 +2729,239 @@ function getStatus(state) {
 
 
 /* ============================================================
-   AUTO REPLY
+   RESPONSE HELPERS
    ============================================================ */
 
-async function processIncomingMessage(
-  state,
-  message
+function ok(
+  res,
+  data = {}
 ) {
 
-  try {
+  return res
+    .status(200)
+    .json({
 
-    if (
-      !AUTO_REPLY_ENABLED
-    ) {
+      success:
+        true,
 
-      return;
+      ...data
+
+    });
+
+}
+
+
+function fail(
+  res,
+  status,
+  code,
+  message,
+  extra = {}
+) {
+
+  return res
+    .status(status)
+    .json({
+
+      success:
+        false,
+
+      error: {
+
+        code,
+
+        message,
+
+        ...extra
+
+      }
+
+    });
+
+}
+
+
+function asyncRoute(
+  fn
+) {
+
+  return (
+    (req, res) => {
+
+      Promise
+        .resolve(
+          fn(req, res)
+        )
+        .catch(
+          err => {
+
+            logger.error(
+              {
+
+                err:
+                  String(
+                    err?.stack ||
+                    err
+                  )
+
+              },
+
+              'Unhandled route error'
+            );
+
+
+            if (
+              !res.headersSent
+            ) {
+
+              fail(
+                res,
+                500,
+                'INTERNAL_ERROR',
+                String(
+                  err?.message ||
+                  err
+                )
+              );
+
+            }
+
+          }
+        );
 
     }
+  );
 
-    if (
-      !message ||
-      message.key?.fromMe
-    ) {
+}
 
-      return;
+
+/* ============================================================
+   WAIT
+   ============================================================ */
+
+function waitForCondition(
+  check,
+  timeoutMs = 15000,
+  intervalMs = 200
+) {
+
+  const started =
+    Date.now();
+
+
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+
+      const timer =
+        setInterval(
+          () => {
+
+            try {
+
+              const result =
+                check();
+
+
+              if (result) {
+
+                clearInterval(
+                  timer
+                );
+
+
+                resolve(
+                  result
+                );
+
+
+                return;
+
+              }
+
+
+              if (
+                Date.now() -
+                started >=
+                timeoutMs
+              ) {
+
+                clearInterval(
+                  timer
+                );
+
+
+                reject(
+                  new Error(
+                    'Timed out waiting for WhatsApp state'
+                  )
+                );
+
+              }
+
+
+            } catch (err) {
+
+              clearInterval(
+                timer
+              );
+
+
+              reject(
+                err
+              );
+
+            }
+
+          },
+          intervalMs
+        );
 
     }
+  );
 
-    const remoteJid =
-      message.key?.remoteJid;
-
-    if (!remoteJid) {
-      return;
-    }
+}
 
 
-    /*
-     * Ignore groups.
-     */
-    if (
-      remoteJid.endsWith(
-        '@g.us'
-      )
-    ) {
+async function waitForQR(
+  account,
+  timeoutMs = 15000
+) {
 
-      return;
-
-    }
+  const state =
+    createAccountState(
+      account
+    );
 
 
-    /*
-     * Ignore broadcast/system chats.
-     */
-    if (
-      remoteJid ===
-      'status@broadcast'
-    ) {
-
-      return;
-
-    }
-
-
-    const phone =
-      extractPhoneFromJid(
-        remoteJid
-      );
-
-    if (!phone) {
-      return;
-    }
-
-
-    state.incomingMessages += 1;
-
-    await markActive(
+  if (
+    qrIsValid(
       state
-    );
+    )
+  ) {
 
-
-    /*
-     * Only first incoming message
-     * from this person.
-     */
-    if (
-      hasReceivedAutoReply(
-        state,
-        phone
-      )
-    ) {
-
-      return;
-
-    }
-
-
-    /*
-     * Mark BEFORE sending.
-     *
-     * This prevents duplicate auto replies
-     * if WhatsApp emits the event twice.
-     */
-    markAutoReplySent(
-      state,
-      phone
-    );
-
-
-    try {
-
-      await state.sock.sendMessage(
-        remoteJid,
-        {
-          text:
-            AUTO_REPLY_TEXT
-        }
-      );
-
-      state.autoReplies += 1;
-
-      state.outgoingMessages += 1;
-
-      logger.info(
-        {
-          account: state.id,
-          phone
-        },
-        'First-message auto reply sent'
-      );
-
-    } catch (err) {
-
-      /*
-       * If sending failed, remove the marker
-       * so the next message can retry.
-       */
-      delete state.repliedUsers[
-        phone
-      ];
-
-      saveRepliedUsers(
-        state
-      );
-
-      logger.error(
-        {
-          account: state.id,
-          phone,
-          err: String(err)
-        },
-        'Auto reply failed'
-      );
-
-    }
-
-  } catch (err) {
-
-    logger.error(
-      {
-        account: state.id,
-        err: String(err)
-      },
-      'Incoming message processing failed'
-    );
+    return state;
 
   }
+
+
+  await getOrCreateSocket(
+    account
+  );
+
+
+  return waitForCondition(
+
+    () =>
+      qrIsValid(state)
+        ? state
+        : null,
+
+    timeoutMs
+
+  );
 
 }
 
@@ -1019,7 +2970,9 @@ async function processIncomingMessage(
    CREATE SOCKET
    ============================================================ */
 
-async function createSocket(account) {
+async function createSocket(
+  account
+) {
 
   const state =
     createAccountState(
@@ -1027,26 +2980,35 @@ async function createSocket(account) {
     );
 
 
-  if (state.sock) {
+  if (
+    state.sock
+  ) {
 
     return state.sock;
 
   }
 
 
-  if (state.connecting) {
+  if (
+    state.connecting
+  ) {
 
-    /*
-     * Wait for another socket creation.
-     */
     await waitForCondition(
+
       () =>
         state.sock ||
         !state.connecting,
-      15000
-    ).catch(() => {});
 
-    if (state.sock) {
+      15000
+
+    ).catch(
+      () => {}
+    );
+
+
+    if (
+      state.sock
+    ) {
 
       return state.sock;
 
@@ -1058,20 +3020,28 @@ async function createSocket(account) {
   state.connecting =
     true;
 
+
   state.status =
     'connecting';
+
 
   state.lastError =
     null;
 
-  state.generation += 1;
+
+  state.generation +=
+    1;
+
 
   const myGeneration =
     state.generation;
 
 
   const accountAuthDir =
-    authPath(account);
+    authPath(
+      account
+    );
+
 
   fs.mkdirSync(
     accountAuthDir,
@@ -1097,24 +3067,36 @@ async function createSocket(account) {
       const latest =
         await fetchLatestBaileysVersion();
 
+
       version =
         latest.version;
 
+
       logger.info(
         {
+
           account,
+
           version
+
         },
+
         'Using latest Baileys version'
       );
+
 
     } catch (err) {
 
       logger.warn(
         {
+
           account,
-          err: String(err)
+
+          err:
+            String(err)
+
         },
+
         'Could not fetch latest Baileys version'
       );
 
@@ -1144,8 +3126,13 @@ async function createSocket(account) {
       printQRInTerminal:
         false,
 
+      /*
+       * WhatsApp account is marked online when connected.
+       * We also explicitly call available on every incoming message.
+       */
+
       markOnlineOnConnect:
-        false,
+        true,
 
       syncFullHistory:
         false,
@@ -1158,7 +3145,9 @@ async function createSocket(account) {
     };
 
 
-    if (version) {
+    if (
+      version
+    ) {
 
       socketOptions.version =
         version;
@@ -1175,6 +3164,7 @@ async function createSocket(account) {
     state.sock =
       sock;
 
+
     state.connecting =
       false;
 
@@ -1186,7 +3176,7 @@ async function createSocket(account) {
 
 
     /* ========================================================
-       INCOMING MESSAGES
+       INCOMING
        ======================================================== */
 
     sock.ev.on(
@@ -1196,9 +3186,6 @@ async function createSocket(account) {
         type
       }) => {
 
-        /*
-         * Handle notify messages.
-         */
         if (
           type !== 'notify'
         ) {
@@ -1206,6 +3193,7 @@ async function createSocket(account) {
           return;
 
         }
+
 
         for (
           const message of
@@ -1224,7 +3212,7 @@ async function createSocket(account) {
 
 
     /* ========================================================
-       CONNECTION EVENTS
+       CONNECTION
        ======================================================== */
 
     sock.ev.on(
@@ -1242,25 +3230,33 @@ async function createSocket(account) {
 
 
         const {
+
           connection,
+
           lastDisconnect,
+
           qr
+
         } = update;
 
 
-        /* ----------------------------------------------------
+        /* ====================================================
            QR
-        ---------------------------------------------------- */
+           ==================================================== */
 
-        if (qr) {
+        if (
+          qr
+        ) {
 
           try {
 
             state.qr =
               qr;
 
+
             state.qrCreatedAt =
               Date.now();
+
 
             state.qrExpiresAt =
               Date.now() +
@@ -1271,24 +3267,35 @@ async function createSocket(account) {
               await QRCode.toDataURL(
                 qr,
                 {
+
                   errorCorrectionLevel:
                     'M',
-                  margin: 2,
-                  width: 420
+
+                  margin:
+                    2,
+
+                  width:
+                    420
+
                 }
               );
 
 
             logger.info(
               {
+
                 account,
+
                 expiresAt:
                   new Date(
                     state.qrExpiresAt
                   ).toISOString()
+
               },
+
               'New QR generated'
             );
+
 
           } catch (err) {
 
@@ -1303,31 +3310,38 @@ async function createSocket(account) {
         }
 
 
-        /* ----------------------------------------------------
+        /* ====================================================
            OPEN
-        ---------------------------------------------------- */
+           ==================================================== */
 
         if (
-          connection === 'open'
+          connection ===
+          'open'
         ) {
 
           state.connected =
             true;
 
+
           state.status =
             'connected';
+
 
           state.connecting =
             false;
 
+
           state.connectedAt =
             Date.now();
+
 
           state.lastDisconnect =
             null;
 
+
           state.lastError =
             null;
+
 
           state.reconnectDelay =
             RECONNECT_DELAY_MS;
@@ -1336,6 +3350,7 @@ async function createSocket(account) {
           clearQR(
             state
           );
+
 
           clearPairing(
             state
@@ -1346,11 +3361,16 @@ async function createSocket(account) {
             sock.user?.id ||
             null;
 
+
           state.phone =
             extractPhoneFromJid(
               state.jid
             );
 
+
+          /*
+           * Immediately mark online.
+           */
 
           await markActive(
             state
@@ -1359,32 +3379,43 @@ async function createSocket(account) {
 
           logger.info(
             {
+
               account,
-              jid: state.jid,
-              phone: state.phone
+
+              jid:
+                state.jid,
+
+              phone:
+                state.phone
+
             },
+
             'WhatsApp connected'
           );
 
         }
 
 
-        /* ----------------------------------------------------
+        /* ====================================================
            CLOSE
-        ---------------------------------------------------- */
+           ==================================================== */
 
         if (
-          connection === 'close'
+          connection ===
+          'close'
         ) {
 
           state.connected =
             false;
 
+
           state.status =
             'disconnected';
 
+
           state.connecting =
             false;
+
 
           state.isAvailable =
             false;
@@ -1396,13 +3427,16 @@ async function createSocket(account) {
 
 
           const errorCode =
+
             lastDisconnect
               ?.error
               ?.output
               ?.statusCode ??
+
             lastDisconnect
               ?.error
               ?.statusCode ??
+
             null;
 
 
@@ -1417,12 +3451,16 @@ async function createSocket(account) {
 
             message:
               String(
+
                 lastDisconnect
                   ?.error
                   ?.message ||
+
                 lastDisconnect
                   ?.error ||
+
                 'Connection closed'
+
               )
 
           };
@@ -1444,11 +3482,17 @@ async function createSocket(account) {
 
           logger.warn(
             {
+
               account,
+
               errorCode,
+
               loggedOut,
+
               replaced
+
             },
+
             'WhatsApp connection closed'
           );
 
@@ -1478,11 +3522,14 @@ async function createSocket(account) {
     state.sock =
       null;
 
+
     state.connecting =
       false;
 
+
     state.status =
       'error';
+
 
     state.lastError =
       String(
@@ -1493,9 +3540,14 @@ async function createSocket(account) {
 
     logger.error(
       {
+
         account,
-        err: String(err)
+
+        err:
+          String(err)
+
       },
+
       'Could not create WhatsApp socket'
     );
 
@@ -1532,18 +3584,23 @@ function scheduleReconnect(
 
   const delay =
     Math.min(
+
       state.reconnectDelay ||
         RECONNECT_DELAY_MS,
+
       MAX_RECONNECT_DELAY_MS
+
     );
 
 
   state.reconnectTimer =
     setTimeout(
+
       async () => {
 
         state.reconnectTimer =
           null;
+
 
         try {
 
@@ -1551,28 +3608,41 @@ function scheduleReconnect(
             account
           );
 
+
           state.reconnectDelay =
             RECONNECT_DELAY_MS;
+
 
         } catch (err) {
 
           logger.error(
             {
+
               account,
-              err: String(err)
+
+              err:
+                String(err)
+
             },
+
             'Automatic reconnect failed'
           );
 
 
           state.reconnectDelay =
             Math.min(
+
               Math.max(
+
                 state.reconnectDelay *
                   2,
+
                 RECONNECT_DELAY_MS
+
               ),
+
               MAX_RECONNECT_DELAY_MS
+
             );
 
 
@@ -1583,14 +3653,16 @@ function scheduleReconnect(
         }
 
       },
+
       delay
+
     );
 
 }
 
 
 /* ============================================================
-   SOCKET
+   GET SOCKET
    ============================================================ */
 
 async function getOrCreateSocket(
@@ -1641,6 +3713,7 @@ async function disconnectSocket(
       state.reconnectTimer
     );
 
+
     state.reconnectTimer =
       null;
 
@@ -1652,7 +3725,8 @@ async function disconnectSocket(
   );
 
 
-  state.generation += 1;
+  state.generation +=
+    1;
 
 
   const sock =
@@ -1662,14 +3736,18 @@ async function disconnectSocket(
   state.sock =
     null;
 
+
   state.connecting =
     false;
+
 
   state.connected =
     false;
 
+
   state.status =
     'disconnected';
+
 
   state.isAvailable =
     false;
@@ -1679,12 +3757,15 @@ async function disconnectSocket(
     state
   );
 
+
   clearPairing(
     state
   );
 
 
-  if (sock) {
+  if (
+    sock
+  ) {
 
     try {
 
@@ -1695,14 +3776,6 @@ async function disconnectSocket(
     } catch (_) {}
 
   }
-
-
-  logger.info(
-    {
-      account
-    },
-    'Account disconnected'
-  );
 
 }
 
@@ -1726,278 +3799,98 @@ async function resetAccount(
   );
 
 
-  const dir =
-    authPath(account);
-
-
   try {
 
     await fs.promises.rm(
-      dir,
+      authPath(account),
       {
-        recursive: true,
-        force: true
+        recursive:
+          true,
+
+        force:
+          true
       }
     );
+
 
   } catch (err) {
 
     logger.warn(
       {
+
         account,
-        err: String(err)
+
+        err:
+          String(err)
+
       },
+
       'Could not remove auth directory'
     );
 
   }
 
 
+  try {
+
+    await fs.promises.rm(
+      autoReplyPath(account),
+      {
+        force:
+          true
+      }
+    );
+
+
+    await fs.promises.rm(
+      historyPath(account),
+      {
+        force:
+          true
+      }
+    );
+
+
+    await fs.promises.rm(
+
+      path.join(
+        dataPath(account),
+        'replied-users.json'
+      ),
+
+      {
+        force:
+          true
+      }
+
+    );
+
+
+  } catch (_) {}
+
+
   state.phone =
     null;
+
 
   state.jid =
     null;
 
+
   state.connectedAt =
     null;
+
 
   state.lastDisconnect =
     null;
 
+
   state.lastError =
     null;
 
+
   state.repliedUsers =
     {};
-
-  saveRepliedUsers(
-    state
-  );
-
-
-  logger.info(
-    {
-      account
-    },
-    'Account authentication reset'
-  );
-
-}
-
-
-/* ============================================================
-   WAIT
-   ============================================================ */
-
-function waitForCondition(
-  check,
-  timeoutMs = 15000,
-  intervalMs = 200
-) {
-
-  const started =
-    Date.now();
-
-
-  return new Promise(
-    (resolve, reject) => {
-
-      const timer =
-        setInterval(
-          () => {
-
-            try {
-
-              const result =
-                check();
-
-
-              if (result) {
-
-                clearInterval(
-                  timer
-                );
-
-                resolve(
-                  result
-                );
-
-                return;
-
-              }
-
-
-              if (
-                Date.now() -
-                started >=
-                timeoutMs
-              ) {
-
-                clearInterval(
-                  timer
-                );
-
-                reject(
-                  new Error(
-                    'Timed out waiting for WhatsApp state'
-                  )
-                );
-
-              }
-
-            } catch (err) {
-
-              clearInterval(
-                timer
-              );
-
-              reject(err);
-
-            }
-
-          },
-          intervalMs
-        );
-
-    }
-  );
-
-}
-
-
-async function waitForQR(
-  account,
-  timeoutMs = 15000
-) {
-
-  const state =
-    createAccountState(
-      account
-    );
-
-
-  if (
-    qrIsValid(state)
-  ) {
-
-    return state;
-
-  }
-
-
-  await getOrCreateSocket(
-    account
-  );
-
-
-  return waitForCondition(
-    () =>
-      qrIsValid(state)
-        ? state
-        : null,
-    timeoutMs
-  );
-
-}
-
-
-/* ============================================================
-   RESPONSE HELPERS
-   ============================================================ */
-
-function ok(
-  res,
-  data = {}
-) {
-
-  return res
-    .status(200)
-    .json({
-
-      success: true,
-
-      ...data
-
-    });
-
-}
-
-
-function fail(
-  res,
-  status,
-  code,
-  message,
-  extra = {}
-) {
-
-  return res
-    .status(status)
-    .json({
-
-      success: false,
-
-      error: {
-
-        code,
-
-        message,
-
-        ...extra
-
-      }
-
-    });
-
-}
-
-
-function asyncRoute(fn) {
-
-  return (
-    (req, res) => {
-
-      Promise
-        .resolve(
-          fn(req, res)
-        )
-        .catch(
-          err => {
-
-            logger.error(
-              {
-                err:
-                  String(
-                    err?.stack ||
-                    err
-                  )
-              },
-              'Unhandled route error'
-            );
-
-
-            if (
-              !res.headersSent
-            ) {
-
-              fail(
-                res,
-                500,
-                'INTERNAL_ERROR',
-                String(
-                  err?.message ||
-                  err
-                )
-              );
-
-            }
-
-          }
-        );
-
-    }
-  );
 
 }
 
@@ -2012,13 +3905,14 @@ app.get(
 
     res.json({
 
-      success: true,
+      success:
+        true,
 
       name:
-        'WhatsApp Multi-Account Connector',
+        'WhatsApp Multi-Account AI Connector',
 
       version:
-        '2.0.0',
+        '3.0.0',
 
       status:
         'online',
@@ -2046,16 +3940,34 @@ app.get(
         auto_reconnect:
           true,
 
-        auto_reply:
-          AUTO_REPLY_ENABLED,
-
-        first_message_only:
+        auto_online_on_message:
           true,
+
+        welcome_message:
+          true,
+
+        busy_message:
+          true,
+
+        ai_auto_reply:
+          OPENAI_ENABLED,
+
+        ai_new_users:
+          AUTO_AI_NEW_USERS,
+
+        ai_only_numbers:
+          true,
+
+        conversation_memory:
+          true,
+
+        multiple_openai_keys:
+          AI_KEYS.length,
 
         broadcast:
           true,
 
-        idle_presence:
+        media:
           true
 
       },
@@ -2090,7 +4002,13 @@ app.get(
           'POST /send-media',
 
         sendToAll:
-          'POST /send-to-all'
+          'POST /send-to-all',
+
+        autoReplyConfig:
+          'GET/POST /auto-reply/config',
+
+        aiNumber:
+          'POST /auto-reply/number'
 
       }
 
@@ -2110,19 +4028,30 @@ app.get(
 
     res.json({
 
-      success: true,
+      success:
+        true,
 
       status:
         'online',
-
-      authentication:
-        'none',
 
       uptime:
         process.uptime(),
 
       accounts:
-        accounts.size
+        accounts.size,
+
+      openai: {
+
+        enabled:
+          OPENAI_ENABLED,
+
+        configured_keys:
+          AI_KEYS.length,
+
+        model:
+          OPENAI_MODEL
+
+      }
 
     });
 
@@ -2167,7 +4096,10 @@ app.get(
 app.get(
   '/qr',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2243,13 +4175,18 @@ app.get(
         );
 
 
-      } catch (err) {
+      } catch (_) {
 
         return fail(
+
           res,
+
           409,
+
           'QR_NOT_AVAILABLE',
+
           'QR is not available yet. Call POST /connect first and try again.'
+
         );
 
       }
@@ -2266,7 +4203,10 @@ app.get(
 app.post(
   '/connect',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2318,12 +4258,13 @@ app.post(
         try {
 
           await waitForCondition(
+
             () =>
               state.connected ||
-              qrIsValid(state)
-                ? true
-                : null,
+              qrIsValid(state),
+
             10000
+
           );
 
         } catch (_) {}
@@ -2349,9 +4290,11 @@ app.post(
 
             expires_at:
               state.qrExpiresAt
+
                 ? new Date(
                     state.qrExpiresAt
                   ).toISOString()
+
                 : null,
 
             phone:
@@ -2361,8 +4304,11 @@ app.post(
               state.jid,
 
             message:
+
               state.connected
+
                 ? 'Connected'
+
                 : 'Connection started. Scan the QR code if provided.'
 
           }
@@ -2372,13 +4318,18 @@ app.post(
       } catch (err) {
 
         return fail(
+
           res,
+
           500,
+
           'CONNECT_FAILED',
+
           String(
             err?.message ||
             err
           )
+
         );
 
       }
@@ -2395,7 +4346,10 @@ app.post(
 app.post(
   '/pair',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2410,9 +4364,13 @@ app.post(
 
         phone =
           normalizePhone(
+
             req.body?.phone ||
+
             req.body?.number ||
+
             req.body?.phone_number
+
           );
 
       } catch (err) {
@@ -2438,10 +4396,15 @@ app.post(
       ) {
 
         return fail(
+
           res,
+
           409,
+
           'ALREADY_CONNECTED',
+
           'Account is already connected'
+
         );
 
       }
@@ -2455,23 +4418,21 @@ app.post(
           );
 
 
-        await new Promise(
-          resolve =>
-            setTimeout(
-              resolve,
-              1500
-            )
+        await sleep(
+          1500
         );
 
 
         const code =
-          await sock.requestPairingCode(
-            phone
-          );
+          await sock
+            .requestPairingCode(
+              phone
+            );
 
 
         state.pairingCode =
           code;
+
 
         state.pairingCreatedAt =
           Date.now();
@@ -2526,13 +4487,18 @@ app.post(
 
 
         return fail(
+
           res,
+
           500,
+
           'PAIRING_FAILED',
+
           String(
             err?.message ||
             err
           )
+
         );
 
       }
@@ -2549,7 +4515,10 @@ app.post(
 app.post(
   '/disconnect',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2589,7 +4558,10 @@ app.post(
 app.post(
   '/reset',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2612,7 +4584,7 @@ app.post(
             'reset',
 
           message:
-            'Authentication reset. Connect again to create a new QR session.'
+            'Authentication and AI conversation state reset. Connect again.'
 
         }
       );
@@ -2623,13 +4595,379 @@ app.post(
 
 
 /* ============================================================
+   GET AUTO REPLY CONFIG
+   ============================================================ */
+
+app.get(
+  '/auto-reply/config',
+  (
+    req,
+    res
+  ) => {
+
+    const account =
+      accountIdFromRequest(
+        req
+      );
+
+
+    return ok(
+      res,
+      {
+
+        account,
+
+        config: {
+
+          ...normalizeConfig(
+            account
+          ),
+
+          openai: {
+
+            enabled:
+              OPENAI_ENABLED,
+
+            configured_keys:
+              AI_KEYS.length,
+
+            model:
+              OPENAI_MODEL
+
+          }
+
+        }
+
+      }
+    );
+
+  }
+);
+
+
+/* ============================================================
+   SET AUTO REPLY CONFIG
+   ============================================================ */
+
+app.post(
+  '/auto-reply/config',
+  (
+    req,
+    res
+  ) => {
+
+    const account =
+      accountIdFromRequest(
+        req
+      );
+
+
+    const current =
+      normalizeConfig(
+        account
+      );
+
+
+    const incoming =
+      req.body || {};
+
+
+    const allowed = [
+
+      'enabled',
+
+      'ai_enabled',
+
+      'ai_new_users',
+
+      'ai_only_numbers',
+
+      'welcome_enabled',
+
+      'welcome_text',
+
+      'busy_enabled',
+
+      'busy_text',
+
+      'busy_mode',
+
+      'ai_all_messages',
+
+      'reply_to_media',
+
+      'system_prompt',
+
+      'max_history'
+
+    ];
+
+
+    const patch = {};
+
+
+    for (
+      const key of
+      allowed
+    ) {
+
+      if (
+        incoming[key] !==
+        undefined
+      ) {
+
+        patch[key] =
+          incoming[key];
+
+      }
+
+    }
+
+
+    if (
+      patch.busy_mode !==
+      undefined
+    ) {
+
+      const mode =
+        String(
+          patch.busy_mode
+        ).toLowerCase();
+
+
+      if (
+        ![
+          'before_ai',
+          'instead'
+        ].includes(mode)
+      ) {
+
+        return fail(
+
+          res,
+
+          422,
+
+          'INVALID_BUSY_MODE',
+
+          'busy_mode must be before_ai or instead'
+
+        );
+
+      }
+
+
+      patch.busy_mode =
+        mode;
+
+    }
+
+
+    const saved =
+      saveConfig(
+
+        account,
+
+        {
+
+          ...current,
+
+          ...patch
+
+        }
+
+      );
+
+
+    return ok(
+      res,
+      {
+
+        account,
+
+        config: {
+
+          ...saved,
+
+          openai: {
+
+            enabled:
+              OPENAI_ENABLED,
+
+            configured_keys:
+              AI_KEYS.length,
+
+            model:
+              OPENAI_MODEL
+
+          }
+
+        },
+
+        message:
+          'Auto-reply configuration saved'
+
+      }
+    );
+
+  }
+);
+
+
+/* ============================================================
+   SET AI-ONLY NUMBER
+   ============================================================ */
+
+/*
+ * POST /auto-reply/number
+ *
+ * {
+ *   "account": "user1",
+ *   "phone": "9876543210",
+ *   "enabled": true
+ * }
+ *
+ * enabled=true:
+ *
+ *     ONLY AI replies
+ *
+ *     Welcome skipped
+ *     Busy skipped
+ *
+ * enabled=false:
+ *
+ *     Number removed from AI-only mode
+ */
+
+app.post(
+  '/auto-reply/number',
+  (
+    req,
+    res
+  ) => {
+
+    const account =
+      accountIdFromRequest(
+        req
+      );
+
+
+    let phone;
+
+
+    try {
+
+      phone =
+        normalizePhone(
+
+          req.body?.phone ||
+
+          req.body?.number
+
+        );
+
+    } catch (err) {
+
+      return fail(
+        res,
+        422,
+        'INVALID_PHONE',
+        err.message
+      );
+
+    }
+
+
+    const cfg =
+      normalizeConfig(
+        account
+      );
+
+
+    const enabled =
+      String(
+        req.body?.enabled ??
+        'true'
+      ).toLowerCase() !==
+      'false';
+
+
+    const set =
+      new Set(
+        cfg.ai_only_numbers
+      );
+
+
+    if (
+      enabled
+    ) {
+
+      set.add(
+        phone
+      );
+
+    } else {
+
+      set.delete(
+        phone
+      );
+
+    }
+
+
+    cfg.ai_only_numbers =
+      [
+        ...set
+      ];
+
+
+    const saved =
+      saveConfig(
+        account,
+        cfg
+      );
+
+
+    return ok(
+      res,
+      {
+
+        account,
+
+        phone,
+
+        ai_only:
+          enabled,
+
+        ai_only_numbers:
+          saved.ai_only_numbers,
+
+        message:
+
+          enabled
+
+            ? `${phone} is now AI-only`
+
+            : `${phone} was removed from AI-only`
+
+      }
+    );
+
+  }
+);
+
+
+/* ============================================================
    SEND MESSAGE
    ============================================================ */
 
 app.post(
   '/send-message',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2644,9 +4982,13 @@ app.post(
 
         phone =
           normalizePhone(
+
             req.body?.phone ||
+
             req.body?.number ||
+
             req.body?.to
+
           );
 
       } catch (err) {
@@ -2663,19 +5005,28 @@ app.post(
 
       const message =
         String(
+
           req.body?.message ??
+
           req.body?.text ??
+
           ''
+
         ).trim();
 
 
       if (!message) {
 
         return fail(
+
           res,
+
           422,
+
           'MESSAGE_REQUIRED',
+
           'Message is required'
+
         );
 
       }
@@ -2693,10 +5044,15 @@ app.post(
       ) {
 
         return fail(
+
           res,
+
           409,
+
           'NOT_CONNECTED',
+
           `Account ${account} is not connected`
+
         );
 
       }
@@ -2716,15 +5072,18 @@ app.post(
 
 
         const result =
-          await state.sock.sendMessage(
-            jid,
-            {
-              text: message
-            }
-          );
+          await state.sock
+            .sendMessage(
+              jid,
+              {
+                text:
+                  message
+              }
+            );
 
 
-        state.outgoingMessages += 1;
+        state.outgoingMessages +=
+          1;
 
 
         return ok(
@@ -2759,13 +5118,18 @@ app.post(
 
 
         return fail(
+
           res,
+
           500,
+
           'SEND_MESSAGE_FAILED',
+
           String(
             err?.message ||
             err
           )
+
         );
 
       }
@@ -2779,27 +5143,13 @@ app.post(
    SEND TO ALL
    ============================================================ */
 
-/*
- * POST /send-to-all
- *
- * JSON:
- *
- * {
- *   "account": "user1",
- *   "phones": [
- *     "9876543210",
- *     "9123456789",
- *     "+919876543210"
- *   ],
- *   "message": "Hello!"
- * }
- *
- */
-
 app.post(
   '/send-to-all',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -2819,10 +5169,15 @@ app.post(
       ) {
 
         return fail(
+
           res,
+
           409,
+
           'NOT_CONNECTED',
+
           `Account ${account} is not connected`
+
         );
 
       }
@@ -2830,56 +5185,66 @@ app.post(
 
       const message =
         String(
+
           req.body?.message ??
+
           req.body?.text ??
+
           ''
+
         ).trim();
 
 
       if (!message) {
 
         return fail(
+
           res,
+
           422,
+
           'MESSAGE_REQUIRED',
+
           'Message is required'
+
         );
 
       }
 
 
       let input =
+
         req.body?.phones ||
+
         req.body?.numbers ||
+
         req.body?.recipients;
 
 
-      /*
-       * Also support:
-       *
-       * "phone": "..."
-       */
       if (
         !input &&
         req.body?.phone
       ) {
 
-        input = [
-          req.body.phone
-        ];
+        input =
+          [
+            req.body.phone
+          ];
 
       }
 
 
       if (
-        typeof input === 'string'
+        typeof input ===
+        'string'
       ) {
 
         input =
           input
             .split(',')
             .map(
-              x => x.trim()
+              x =>
+                x.trim()
             )
             .filter(Boolean);
 
@@ -2888,47 +5253,69 @@ app.post(
 
       if (
         !Array.isArray(input) ||
-        input.length === 0
+        !input.length
       ) {
 
         return fail(
+
           res,
+
           422,
+
           'RECIPIENTS_REQUIRED',
+
           'phones must be a non-empty array'
+
         );
 
       }
 
 
-      /*
-       * Remove duplicate numbers.
-       */
-      const unique =
-        [
-          ...new Set(
-            input.map(
+      const unique = [
+
+        ...new Set(
+
+          input
+
+            .map(
               x => {
+
                 try {
-                  return normalizePhone(x);
+
+                  return normalizePhone(
+                    x
+                  );
+
                 } catch (_) {
+
                   return null;
+
                 }
+
               }
-            ).filter(Boolean)
-          )
-        ];
+            )
+
+            .filter(Boolean)
+
+        )
+
+      ];
 
 
       if (
-        unique.length === 0
+        !unique.length
       ) {
 
         return fail(
+
           res,
+
           422,
+
           'NO_VALID_RECIPIENTS',
+
           'No valid phone numbers were supplied'
+
         );
 
       }
@@ -2939,30 +5326,36 @@ app.post(
       );
 
 
-      const results = [];
+      const results =
+        [];
+
 
       for (
-        const phone of unique
+        const phone of
+        unique
       ) {
-
-        const jid =
-          jidForPhone(
-            phone
-          );
-
 
         try {
 
-          const result =
-            await state.sock.sendMessage(
-              jid,
-              {
-                text: message
-              }
+          const jid =
+            jidForPhone(
+              phone
             );
 
 
-          state.outgoingMessages += 1;
+          const result =
+            await state.sock
+              .sendMessage(
+                jid,
+                {
+                  text:
+                    message
+                }
+              );
+
+
+          state.outgoingMessages +=
+            1;
 
 
           results.push({
@@ -2981,18 +5374,8 @@ app.post(
           });
 
 
-          /*
-           * Small delay between messages.
-           *
-           * This is intentionally conservative
-           * to avoid hammering the connection.
-           */
-          await new Promise(
-            resolve =>
-              setTimeout(
-                resolve,
-                250
-              )
+          await sleep(
+            250
           );
 
 
@@ -3020,12 +5403,9 @@ app.post(
 
       const sent =
         results.filter(
-          x => x.success
+          x =>
+            x.success
         ).length;
-
-      const failed =
-        results.length -
-        sent;
 
 
       return ok(
@@ -3039,7 +5419,9 @@ app.post(
 
           sent,
 
-          failed,
+          failed:
+            results.length -
+            sent,
 
           results
 
@@ -3058,7 +5440,10 @@ app.post(
 app.post(
   '/send-media',
   asyncRoute(
-    async (req, res) => {
+    async (
+      req,
+      res
+    ) => {
 
       const account =
         accountIdFromRequest(
@@ -3073,9 +5458,13 @@ app.post(
 
         phone =
           normalizePhone(
+
             req.body?.phone ||
+
             req.body?.number ||
+
             req.body?.to
+
           );
 
       } catch (err) {
@@ -3092,20 +5481,30 @@ app.post(
 
       const mediaUrl =
         String(
+
           req.body?.media_url ||
+
           req.body?.url ||
+
           req.body?.mediaUrl ||
+
           ''
+
         ).trim();
 
 
       if (!mediaUrl) {
 
         return fail(
+
           res,
+
           422,
+
           'MEDIA_URL_REQUIRED',
+
           'media_url is required'
+
         );
 
       }
@@ -3113,9 +5512,13 @@ app.post(
 
       const type =
         String(
+
           req.body?.media_type ||
+
           req.body?.type ||
+
           'image'
+
         ).toLowerCase();
 
 
@@ -3138,10 +5541,15 @@ app.post(
       ) {
 
         return fail(
+
           res,
+
           409,
+
           'NOT_CONNECTED',
+
           `Account ${account} is not connected`
+
         );
 
       }
@@ -3164,14 +5572,20 @@ app.post(
 
 
         if (
-          type === 'image' ||
-          type === 'photo'
+
+          type ===
+            'image' ||
+
+          type ===
+            'photo'
+
         ) {
 
           content = {
 
             image: {
-              url: mediaUrl
+              url:
+                mediaUrl
             },
 
             caption
@@ -3187,7 +5601,8 @@ app.post(
           content = {
 
             video: {
-              url: mediaUrl
+              url:
+                mediaUrl
             },
 
             caption
@@ -3203,7 +5618,8 @@ app.post(
           content = {
 
             audio: {
-              url: mediaUrl
+              url:
+                mediaUrl
             },
 
             mimetype:
@@ -3211,6 +5627,7 @@ app.post(
               'audio/mpeg',
 
             ptt:
+
               String(
                 req.body?.ptt ||
                 ''
@@ -3222,23 +5639,34 @@ app.post(
         }
 
         else if (
-          type === 'document' ||
-          type === 'file'
+
+          type ===
+            'document' ||
+
+          type ===
+            'file'
+
         ) {
 
           content = {
 
             document: {
-              url: mediaUrl
+              url:
+                mediaUrl
             },
 
             mimetype:
+
               req.body?.mimetype ||
+
               'application/octet-stream',
 
             fileName:
+
               req.body?.file_name ||
+
               req.body?.filename ||
+
               'file',
 
             caption
@@ -3250,23 +5678,30 @@ app.post(
         else {
 
           return fail(
+
             res,
+
             422,
+
             'INVALID_MEDIA_TYPE',
+
             'media_type must be image, video, audio, or document'
+
           );
 
         }
 
 
         const result =
-          await state.sock.sendMessage(
-            jid,
-            content
-          );
+          await state.sock
+            .sendMessage(
+              jid,
+              content
+            );
 
 
-        state.outgoingMessages += 1;
+        state.outgoingMessages +=
+          1;
 
 
         return ok(
@@ -3304,13 +5739,18 @@ app.post(
 
 
         return fail(
+
           res,
+
           500,
+
           'SEND_MEDIA_FAILED',
+
           String(
             err?.message ||
             err
           )
+
         );
 
       }
@@ -3325,29 +5765,35 @@ app.post(
    ============================================================ */
 
 app.use(
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
-    res.status(404).json({
+    res
+      .status(404)
+      .json({
 
-      success: false,
+        success:
+          false,
 
-      error: {
+        error: {
 
-        code:
-          'ENDPOINT_NOT_FOUND',
+          code:
+            'ENDPOINT_NOT_FOUND',
 
-        message:
-          'Endpoint not found',
+          message:
+            'Endpoint not found',
 
-        method:
-          req.method,
+          method:
+            req.method,
 
-        path:
-          req.path
+          path:
+            req.path
 
-      }
+        }
 
-    });
+      });
 
   }
 );
@@ -3358,16 +5804,24 @@ app.use(
    ============================================================ */
 
 app.use(
-  (err, req, res, next) => {
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
 
     logger.error(
       {
+
         err:
           String(
             err?.stack ||
             err
           )
+
       },
+
       'Express error'
     );
 
@@ -3376,29 +5830,34 @@ app.use(
       res.headersSent
     ) {
 
-      return next(err);
+      return next(
+        err
+      );
 
     }
 
 
-    res.status(500).json({
+    res
+      .status(500)
+      .json({
 
-      success: false,
+        success:
+          false,
 
-      error: {
+        error: {
 
-        code:
-          'INTERNAL_ERROR',
+          code:
+            'INTERNAL_ERROR',
 
-        message:
-          String(
-            err?.message ||
-            err
-          )
+          message:
+            String(
+              err?.message ||
+              err
+            )
 
-      }
+        }
 
-    });
+      });
 
   }
 );
@@ -3410,8 +5869,11 @@ app.use(
 
 const server =
   app.listen(
+
     PORT,
+
     HOST,
+
     () => {
 
       logger.info(
@@ -3439,18 +5901,31 @@ const server =
             IDLE_TIMEOUT_MS,
 
           autoReply:
-            AUTO_REPLY_ENABLED
+            AUTO_REPLY_DEFAULT_ENABLED,
+
+          openAI:
+            OPENAI_ENABLED,
+
+          openAIKeys:
+            AI_KEYS.length,
+
+          openAIModel:
+            OPENAI_MODEL
 
         },
-        'WhatsApp connector started'
+
+        'WhatsApp AI connector started'
       );
 
 
       console.log(
-        `WhatsApp connector listening on ${HOST}:${PORT}`
+
+        `WhatsApp AI connector listening on ${HOST}:${PORT}`
+
       );
 
     }
+
   );
 
 
@@ -3464,15 +5939,20 @@ async function restoreAccounts() {
 
     const entries =
       await fs.promises.readdir(
+
         AUTH_DIR,
+
         {
-          withFileTypes: true
+          withFileTypes:
+            true
         }
+
       );
 
 
     for (
-      const entry of entries
+      const entry of
+      entries
     ) {
 
       if (
@@ -3491,60 +5971,79 @@ async function restoreAccounts() {
 
 
       if (!account) {
+        continue;
+      }
+
+
+      const credsPath =
+        path.join(
+
+          AUTH_DIR,
+
+          account,
+
+          'creds.json'
+
+        );
+
+
+      if (
+        !fs.existsSync(
+          credsPath
+        )
+      ) {
 
         continue;
 
       }
 
 
-      const credsPath =
-        path.join(
-          AUTH_DIR,
-          account,
-          'creds.json'
-        );
+      logger.info(
+        {
 
-
-      if (
-        fs.existsSync(
-          credsPath
-        )
-      ) {
-
-        logger.info(
-          {
-            account
-          },
-          'Restoring saved WhatsApp account'
-        );
-
-
-        createSocket(
           account
-        ).catch(
+
+        },
+
+        'Restoring saved WhatsApp account'
+      );
+
+
+      createSocket(
+        account
+      )
+        .catch(
           err => {
 
             logger.error(
               {
+
                 account,
-                err: String(err)
+
+                err:
+                  String(err)
+
               },
+
               'Account restore failed'
             );
 
           }
         );
 
-      }
-
     }
+
 
   } catch (err) {
 
     logger.error(
       {
-        err: String(err)
+
+        err:
+          String(err)
+
       },
+
       'Account restore scan failed'
     );
 
@@ -3557,7 +6056,7 @@ restoreAccounts();
 
 
 /* ============================================================
-   GRACEFUL SHUTDOWN
+   SHUTDOWN
    ============================================================ */
 
 async function shutdown(
@@ -3576,7 +6075,8 @@ async function shutdown(
     const [
       account,
       state
-    ] of accounts.entries()
+    ]
+    of accounts.entries()
   ) {
 
     try {
@@ -3588,6 +6088,7 @@ async function shutdown(
         clearTimeout(
           state.reconnectTimer
         );
+
 
         state.reconnectTimer =
           null;
@@ -3604,7 +6105,9 @@ async function shutdown(
         state.sock
       ) {
 
-        state.generation += 1;
+        state.generation +=
+          1;
+
 
         state.sock.end(
           undefined
@@ -3615,8 +6118,11 @@ async function shutdown(
 
       logger.info(
         {
+
           account
+
         },
+
         'Closed account socket'
       );
 
@@ -3625,9 +6131,14 @@ async function shutdown(
 
       logger.warn(
         {
+
           account,
-          err: String(err)
+
+          err:
+            String(err)
+
         },
+
         'Error while closing account'
       );
 
@@ -3637,16 +6148,14 @@ async function shutdown(
 
 
   server.close(
-    () => {
-
-      process.exit(0);
-
-    }
+    () =>
+      process.exit(0)
   );
 
 
   setTimeout(
-    () => process.exit(0),
+    () =>
+      process.exit(0),
     5000
   ).unref();
 
@@ -3656,13 +6165,18 @@ async function shutdown(
 process.on(
   'SIGTERM',
   () =>
-    shutdown('SIGTERM')
+    shutdown(
+      'SIGTERM'
+    )
 );
+
 
 process.on(
   'SIGINT',
   () =>
-    shutdown('SIGINT')
+    shutdown(
+      'SIGINT'
+    )
 );
 
 
@@ -3676,12 +6190,15 @@ process.on(
 
     logger.error(
       {
+
         err:
           String(
             err?.stack ||
             err
           )
+
       },
+
       'Uncaught exception'
     );
 
@@ -3695,12 +6212,15 @@ process.on(
 
     logger.error(
       {
+
         err:
           String(
             err?.stack ||
             err
           )
+
       },
+
       'Unhandled promise rejection'
     );
 
