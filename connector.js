@@ -1,37 +1,3 @@
-/**
- * ============================================================
- * WhatsApp Multi-Account + AI Auto Reply Connector
- * ============================================================
- *
- * FEATURES
- * - Multi WhatsApp accounts
- * - Persistent Baileys sessions
- * - QR login
- * - Pairing code
- * - Automatic reconnect
- * - Automatic online/available on incoming message
- * - Welcome message
- * - Busy message
- * - AI auto reply
- * - AI-only selected numbers
- * - AI auto reply for new users
- * - Per-number conversation memory
- * - Multiple OpenAI API key rotation/failover
- * - Send message
- * - Send media
- * - Send to all
- *
- * IMPORTANT:
- * NEVER put OpenAI API keys directly in this file.
- *
- * Use:
- * OPENAI_API_KEY_1
- * OPENAI_API_KEY_2
- * OPENAI_API_KEY_3
- * etc.
- *
- * ============================================================
- */
 
 'use strict';
 
