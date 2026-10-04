@@ -1,8 +1,8 @@
 {
-  "name": "whatsapp-multi-account-connector",
-  "version": "2.0.0",
+  "name": "whatsapp-multi-account-ai-connector",
+  "version": "3.0.0",
   "private": true,
-  "description": "Production-ready multi-account WhatsApp connector with QR, pairing, messaging, media and OTP services",
+  "description": "WhatsApp multi-account Baileys connector with AI auto replies, welcome/busy messages, presence and OpenAI key failover",
   "main": "connector.js",
   "scripts": {
     "start": "node connector.js",
