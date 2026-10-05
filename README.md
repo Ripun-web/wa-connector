@@ -1392,7 +1392,7 @@ If this project helped you:
 
 ### GitHub
 
-**[YOUR_GITHUB_REPOSITORY_LINK](https://github.com/Ripun-web/wa-connector)**
+**[GITHUB_REPOSITORY_LINK](https://github.com/Ripun-web/wa-connector)**
 
 ### Railway
 
