@@ -1392,19 +1392,19 @@ If this project helped you:
 
 ### GitHub
 
-**YOUR_GITHUB_REPOSITORY_LINK**
+**[YOUR_GITHUB_REPOSITORY_LINK](https://github.com/Ripun-web/wa-connector)**
 
 ### Railway
 
-**YOUR_RAILWAY_DEPLOY_LINK**
+[**RAILWAY_LINK**](https://railway.com/)
 
 ### API Panel Download
 
-**YOUR_API_PANEL_DOWNLOAD_LINK**
+**6002322737**
 
 ### RB Developments
 
-**YOUR_RB_DEVELOPMENTS_WEBSITE**
+[**B_DEVELOPMENTS_WEBSITE**](https://rb-online.in/)
 
 ---
 
