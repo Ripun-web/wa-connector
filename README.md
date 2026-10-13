@@ -2,82 +2,25 @@
 
 Simple Node.js + Baileys WhatsApp connector for Ubuntu/Linux hosting.
 
-## Included
+## Services kept
 
 - QR connection
 - Automatic reconnect
 - Send one-to-one text messages
+- Health and status
+- Disconnect
 - OTP request and verification service
-- API token authentication
-- Health and status endpoints
-- Basic per-number OTP rate limits
-- Ubuntu GitHub Actions check
 - No AI features
-- No campaign/bulk-message engine
+- No campaign/bulk engine
+- No API key required
 
-## Important
+## OTP API
 
-There is no technical way to guarantee that a WhatsApp account will never be banned. Use this connector only for legitimate messaging, obtain recipient consent, respect WhatsApp rules, and avoid spam or unwanted automation.
+### Send OTP
 
-## Requirements
+`POST /send-otp`
 
-- Ubuntu/Linux
-- Node.js 20+
-- npm
-
-## Install
-
-```bash
-git clone https://github.com/Ripun-web/wa-connector.git
-cd wa-connector
-npm install
-cp .env.example .env
-```
-
-Set a strong `CONNECTOR_API_TOKEN` in `.env`, then start:
-
-```bash
-npm start
-```
-
-Default port: `3000`.
-
-## Endpoints
-
-All endpoints except `/health` require `Authorization: Bearer YOUR_TOKEN` or `X-API-Token: YOUR_TOKEN`.
-
-### Health
-
-`GET /health`
-
-### Status
-
-`GET /status`
-
-### Start WhatsApp connection
-
-`POST /connect`
-
-Then use `GET /qr.png` to obtain the QR image when available.
-
-### Send message
-
-`POST /send-message`
-
-JSON:
-
-```json
-{
-  "phone": "9876543210",
-  "message": "Hello"
-}
-```
-
-### Request OTP
-
-`POST /otp/request`
-
-JSON:
+Also supported: `POST /otp/request`
 
 ```json
 {
@@ -85,13 +28,11 @@ JSON:
 }
 ```
 
-The service creates a random 6-digit OTP, stores only its SHA-256 hash in memory, and sends the OTP through the connected WhatsApp account. Default expiry is 5 minutes.
-
 ### Verify OTP
 
-`POST /otp/verify`
+`POST /verify-otp`
 
-JSON:
+Also supported: `POST /otp/verify`
 
 ```json
 {
@@ -100,40 +41,51 @@ JSON:
 }
 ```
 
-Successful verification consumes the OTP.
+OTP defaults:
 
-### Disconnect
+- 6 digits
+- 5 minute expiry
+- 60 second resend cooldown
+- 5 requests per number per hour
+- 5 failed verification attempts per OTP
+- 3 second minimum delay between outgoing messages
+- OTP hash stored in memory, not plaintext
 
-`POST /disconnect`
+## Normal API
 
-## OTP protection
+- `GET /`
+- `GET /health`
+- `GET /status`
+- `GET /qr`
+- `GET /qr.png`
+- `POST /connect`
+- `POST /send-message`
+- `POST /disconnect`
 
-Defaults:
+No API key is required for these endpoints.
 
-- 6-digit OTP
-- 5-minute expiry
-- 60-second resend cooldown
-- 5 OTP requests per number per hour
-- 3-second minimum delay between outgoing messages
+## Install on Ubuntu / Railway
 
-These are application-level controls, not WhatsApp guarantees.
+Requirements:
 
-## cPanel / Node.js application
+- Ubuntu/Linux
+- Node.js 20+
+- npm
 
-Use Node.js 20 or newer.
+```bash
+git clone https://github.com/Ripun-web/wa-connector.git
+cd wa-connector
+npm install
+cp .env.example .env
+npm start
+```
 
-- Application root: repository folder, for example `wa-connector`
-- Application URL: your chosen domain/subdomain
-- Startup file: `connector.js`
-- Application mode: Production
-- Environment variables: copy values from `.env.example`
+Railway can use `npm start` as the start command and will provide the `PORT` environment variable.
 
-After dependencies are installed, restart the Node.js application.
+## GitHub Actions
 
-## Ubuntu GitHub Actions
+CI uses `ubuntu-latest` only. No macOS runner is used.
 
-The repository uses `ubuntu-latest` only for CI. No macOS runner is required.
+## Important usage note
 
-## License
-
-Use responsibly and comply with applicable WhatsApp and local requirements.
+There is no technical way to guarantee that a WhatsApp account will never be banned. This connector does not provide a "no-ban" guarantee. Use it for legitimate, consented messaging, avoid spam/unwanted automation, and follow WhatsApp requirements.
