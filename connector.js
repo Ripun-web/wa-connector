@@ -177,7 +177,7 @@ const CAMPAIGN_FILE =
     path.join(DATA_DIR, 'campaign.json');
 
 const QR_FILE =
-    process.env.QR_FILE || path.join(DATA_DIR, 'qr.png');
+    path.join(DATA_DIR, 'qr.png');
 
 [
     DATA_DIR,

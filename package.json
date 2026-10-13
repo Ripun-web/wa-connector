@@ -4,8 +4,7 @@
   "description": "Compliance-first WhatsApp Baileys connector",
   "main": "connector.js",
   "scripts": {
-    "start": "node gateway.js",
-    "start:worker": "node connector.js"
+    "start": "node connector.js"
   },
   "engines": {
     "node": ">=20"
