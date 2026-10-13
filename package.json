@@ -1,16 +1,17 @@
 {
   "name": "rbwa-whatsapp-connector",
-  "version": "5.0.0",
-  "description": "Compliance-first WhatsApp Baileys connector",
+  "version": "6.0.0",
+  "description": "Simple WhatsApp connector with QR, pairing, messaging and OTP service",
   "main": "connector.js",
   "scripts": {
-    "start": "node connector.js"
+    "start": "node connector.js",
+    "check": "node --check connector.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "latest",
+    "@whiskeysockets/baileys": "^6.7.18",
     "express": "^5.1.0",
     "pino": "^10.1.0",
     "qrcode": "^1.5.4"
